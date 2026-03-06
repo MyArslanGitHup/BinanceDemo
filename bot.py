@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
 TRADE_USDT_FIXED = 100
 MARGIN_TYPE   = "ISOLATED"
-BASE_URL      = "https://fapi.binance.com"
+BASE_URL      = "https://demo-fapi.binance.com"
 
 # ─── SABİT STRATEJİ ─────────────────────────────────────────────
 FIXED_LEVERAGE   = 10
