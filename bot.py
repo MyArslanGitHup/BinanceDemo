@@ -12,7 +12,6 @@ SABİT STRATEJİ:
   SL  %2.0  sabit
   Kalan %20 → TSL ile korunur
 """
-
 import os
 import json
 import logging
