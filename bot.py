@@ -755,9 +755,11 @@ def process_signal(data: dict) -> dict:
 
     # ── Margin & Kaldıraç ───────────────────────────────────────
     set_margin_type(symbol)
-    valid_leverage = get_valid_leverage(symbol, FIXED_LEVERAGE)
-    if not set_leverage(symbol, valid_leverage):
-        return {"error": "Kaldıraç ayarlanamadı"}
+    #valid_leverage = get_valid_leverage(symbol, FIXED_LEVERAGE)
+    #if not set_leverage(symbol, valid_leverage):
+    #    return {"error": "Kaldıraç ayarlanamadı"}
+  # kaldıraç sorunu çözülüncü, sonradan hemen üstteki 3 satırı aktif edersin. alttaki satırı ise silersin. veya pasife alırsın. 
+    valid_leverage = FIXED_LEVERAGE
 
     # ── Miktar ─────────────────────────────────────────────────
     quantity = calculate_quantity(symbol, valid_leverage, current_price, qty_precision)
