@@ -758,6 +758,8 @@ def process_signal(data: dict) -> dict:
         return {"error": "Fiyat alınamadı"}
 
     # ── Margin & Kaldıraç ───────────────────────────────────────
+    set_margin_type(symbol)
+    set_leverage(symbol, FIXED_LEVERAGE)
     valid_leverage = FIXED_LEVERAGE
 
     # ── Miktar ─────────────────────────────────────────────────
