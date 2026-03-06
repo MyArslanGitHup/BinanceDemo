@@ -49,7 +49,7 @@ PORT             = int(os.getenv("PORT", 5000))
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",     "YOUR_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-TRADE_USDT_FIXED = 100  # Sabit işlem miktarı (USDT)
+TRADE_PERCENT = 3.0
 MARGIN_TYPE   = "ISOLATED"
 BASE_URL      = "https://fapi.binance.com"
 
@@ -536,12 +536,11 @@ def set_margin_type(symbol):
 
 
 def calculate_quantity(symbol, leverage, price, qty_precision):
-    # balance    = get_usdt_balance()
-    # trade_usdt = balance * (TRADE_PERCENT / 100) * leverage
-    trade_usdt = TRADE_USDT_FIXED * leverage  # Sabit 100 USDT marjin
+    balance    = get_usdt_balance()
+    trade_usdt = balance * (TRADE_PERCENT / 100) * leverage
     quantity   = trade_usdt / price
     quantity   = round(quantity, qty_precision)
-    log.info(f"Sabit işlem: {TRADE_USDT_FIXED} USDT marjin | {trade_usdt:.2f} USDT pozisyon | Miktar: {quantity}")
+    log.info(f"Bakiye: {balance:.2f} USDT | İşlem: {trade_usdt:.2f} USDT | Miktar: {quantity}")
     return quantity
 
 
@@ -756,11 +755,9 @@ def process_signal(data: dict) -> dict:
 
     # ── Margin & Kaldıraç ───────────────────────────────────────
     set_margin_type(symbol)
-    #valid_leverage = get_valid_leverage(symbol, FIXED_LEVERAGE)
-    #if not set_leverage(symbol, valid_leverage):
-    #    return {"error": "Kaldıraç ayarlanamadı"}
-  # kaldıraç sorunu çözülüncü, sonradan hemen üstteki 3 satırı aktif edersin. alttaki satırı ise silersin. veya pasife alırsın. 
-    valid_leverage = FIXED_LEVERAGE
+    valid_leverage = get_valid_leverage(symbol, FIXED_LEVERAGE)
+    if not set_leverage(symbol, valid_leverage):
+        return {"error": "Kaldıraç ayarlanamadı"}
 
     # ── Miktar ─────────────────────────────────────────────────
     quantity = calculate_quantity(symbol, valid_leverage, current_price, qty_precision)
