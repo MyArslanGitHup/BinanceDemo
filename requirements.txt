@@ -1,0 +1,5 @@
+flask==3.0.3
+binance-futures-connector==4.0.0
+python-dotenv==1.0.1
+python-telegram-bot==21.5
+requests==2.31.0
