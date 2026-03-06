@@ -48,7 +48,7 @@ PORT             = int(os.getenv("PORT", 5000))
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",     "YOUR_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-trade_usdt = balance * (TRADE_PERCENT / 100) * leverage
+TRADE_USDT_FIXED = 100
 MARGIN_TYPE   = "ISOLATED"
 BASE_URL      = "https://fapi.binance.com"
 
