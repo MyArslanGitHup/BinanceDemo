@@ -838,9 +838,17 @@ def round_to_tick(price: float, tick_size: float) -> float:
 def get_current_price(symbol):
     try:
         ticker = client.ticker_price(symbol=symbol)
-        return float(ticker["price"])
+        # ticker liste veya dict olarak gelebilir
+        if isinstance(ticker, list):
+            ticker = ticker[0]
+        price = ticker.get("price") or ticker.get("lastPrice") or ticker.get("c")
+        if price:
+            return float(price)
+        log.error(f"Fiyat alanı bulunamadı: {ticker}")
     except ClientError as e:
         log.error(f"Fiyat alınamadı: {e}")
+    except Exception as e:
+        log.error(f"Fiyat beklenmedik hata: {e}")
     return 0.0
 
 
