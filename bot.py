@@ -75,7 +75,7 @@ ATR_REGIMES = {
     "orta":  {"sl": 2.0, "tps": [2, 4, 6, 8],    "tsl": 1.5},
     "genis": {"sl": 3.5, "tps": [3, 6, 9, 12],   "tsl": 3.0},
 }
-ATR_PERIOD          = 14    # ATR hesaplama periyodu (mum sayısı)
+ATR_PERIOD          = 13    # ATR hesaplama periyodu — TradingView göstergesiyle eşleşir (SMA 13)
 ATR_FALLBACK_TF     = "1h"  # TradingView timeframe gelmezse kullanılacak varsayılan
 
 # ─── BİNANCE CLIENT ─────────────────────────────────────────────
@@ -179,12 +179,13 @@ def get_atr_pct(symbol: str, interval: str, period: int = ATR_PERIOD) -> float:
     Hata durumunda None döner.
     """
     try:
-        limit  = period + 1
+        limit  = max(period + 2, 50)  # min 50 bar: TradingView warm-up ile yakınsar
         klines = client.klines(symbol=symbol, interval=interval, limit=limit)
         if len(klines) < period + 1:
             log.warning(f"{symbol} ATR için yeterli mum yok ({len(klines)}) [{interval}]")
             return None
 
+        klines = klines[:-1]  # offset=1: açık mumu çıkar
         highs  = [float(k[2]) for k in klines]
         lows   = [float(k[3]) for k in klines]
         closes = [float(k[4]) for k in klines]
@@ -569,6 +570,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━\n"
         "📋 <b>Komutlar:</b>\n\n"
         "/sinyal — Manuel sinyal gönder\n"
+        "/atr [COIN] — Coin ATR analizi (15dk/1sa/4sa)\n"
         "/pozisyonlar — Açık pozisyonları göster\n"
         "/kapat [COIN] — Pozisyon kapat\n"
         "/bakiye — USDT bakiyesi\n"
@@ -716,6 +718,36 @@ async def cmd_istatistik(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── MANUEL SİNYAL ──────────────────────────────────────────────
 user_states = {}
 
+async def cmd_atr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kullanım: /atr SOLUSDT veya /atr SOL"""
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Kullanım: /atr SOLUSDT\nveya /atr SOL"
+        )
+        return
+
+    raw    = context.args[0].upper().replace(".P", "").replace("USDT", "")
+    symbol = raw + "USDT"
+
+    await update.message.reply_text(f"⏳ {symbol} ATR hesaplanıyor...")
+
+    lines = [f"📊 <b>{symbol} — ATR Analizi</b>\n━━━━━━━━━━━━━━━"]
+    for label, tv_tf, binance_tf in [
+        ("15dk", "15",  "15m"),
+        ("1sa",  "60",  "1h"),
+        ("4sa",  "240", "4h"),
+    ]:
+        atr_pct = get_atr_pct(symbol, interval=binance_tf)
+        if atr_pct is None:
+            lines.append(f"⏱ <b>{label}:</b> ATR alınamadı")
+            continue
+        regime = get_regime(atr_pct)
+        emoji  = {"dar": "🔵", "orta": "🟡", "genis": "🔴"}.get(regime, "⚪")
+        lines.append(f"⏱ <b>{label}:</b> ATR={atr_pct:.2f}%  {emoji} {regime.upper()}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_sinyal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states[update.effective_user.id] = {"step": "coin"}
     await update.message.reply_text(
@@ -773,13 +805,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state["step"] == "coin":
         symbol = text.replace(".P", "").replace("USDT", "") + "USDT"
         state["symbol"] = symbol
-        state["step"]   = "side"
+        state["step"]   = "timeframe"
         keyboard = [[
-            InlineKeyboardButton("🟢 AL (LONG)",   callback_data="side_BUY"),
-            InlineKeyboardButton("🔴 SAT (SHORT)", callback_data="side_SELL"),
+            InlineKeyboardButton("⏱ 15dk",  callback_data="tf_15"),
+            InlineKeyboardButton("⏱ 1sa",   callback_data="tf_60"),
+            InlineKeyboardButton("⏱ 4sa",   callback_data="tf_240"),
         ]]
         await update.message.reply_text(
-            f"📌 Coin: <b>{symbol}</b>\n\nYön seçin:",
+            f"📌 Coin: <b>{symbol}</b>\n\nPeriyot seçin:",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -791,7 +824,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     data = query.data
 
-    if data.startswith("side_"):
+    if data.startswith("tf_"):
+        tv_interval = data.split("_")[1]   # "15", "60", "240"
+        state = user_states.get(uid, {})
+        if not state:
+            await query.edit_message_text("⚠️ Oturum süresi doldu. /sinyal ile tekrar başlayın.")
+            return
+        state["tv_interval"] = tv_interval
+        state["step"]        = "side"
+        label_map = {"15": "15 dakika", "60": "1 saat", "240": "4 saat"}
+        keyboard = [[
+            InlineKeyboardButton("🟢 AL (LONG)",   callback_data="side_BUY"),
+            InlineKeyboardButton("🔴 SAT (SHORT)", callback_data="side_SELL"),
+        ]]
+        await query.edit_message_text(
+            f"📌 Coin: <b>{state['symbol']}</b>\n"
+            f"⏱ Periyot: <b>{label_map.get(tv_interval, tv_interval)}</b>\n\n"
+            f"Yön seçin:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("side_"):
         side  = data.split("_")[1]
         state = user_states.get(uid, {})
         if not state:
@@ -804,8 +858,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_price = get_current_price(state["symbol"])
         _, _, tick_size, _ = get_symbol_info(state["symbol"])
 
-        # ATR bazlı strateji parametrelerini al
-        strategy = get_strategy_params(state["symbol"])
+        # ATR bazlı strateji parametrelerini al (manuel periyot ile)
+        strategy = get_strategy_params(state["symbol"], tv_interval=state.get("tv_interval", ""))
         state["strategy"] = strategy
 
         sl_pct  = strategy["sl"]
@@ -864,9 +918,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⏳ Sinyal gönderiliyor...")
 
         payload = {
-            "secret": WEBHOOK_SECRET,
-            "symbol": state["symbol"],
-            "side":   state["side"].lower(),
+            "secret":    WEBHOOK_SECRET,
+            "symbol":    state["symbol"],
+            "side":      state["side"].lower(),
+            "timeframe": state.get("tv_interval", ""),
         }
         try:
             result = process_signal(payload)
@@ -1445,6 +1500,7 @@ def run_telegram():
         telegram_app.add_handler(CommandHandler("bakiye",           cmd_bakiye))
         telegram_app.add_handler(CommandHandler("pozisyonlar",      cmd_pozisyonlar))
         telegram_app.add_handler(CommandHandler("kapat",            cmd_kapat))
+        telegram_app.add_handler(CommandHandler("atr",              cmd_atr))
         telegram_app.add_handler(CommandHandler("sinyal",           cmd_sinyal))
         telegram_app.add_handler(CommandHandler("istatistik",       cmd_istatistik))
         telegram_app.add_handler(CommandHandler("istatistik_tarih", cmd_istatistik_tarih))
