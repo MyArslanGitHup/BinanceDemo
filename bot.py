@@ -400,6 +400,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/kapat [COIN] — Pozisyon kapat\n"
         "/bakiye — USDT bakiyesi\n"
         "/istatistik — Son 24 saatin özeti\n"
+        "/istatistik_tarih — Tarih seçerek özet\n"
         "/istatistik 01.03.2026 — Tarihten itibaren özet\n"
         "/yardim — Bu menü\n"
     )
@@ -511,8 +512,12 @@ async def cmd_istatistik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     now = datetime.now(timezone.utc)
 
-    if context.args:
-        date_str = context.args[0]
+    # Tüm mesajı al, komut kısmını çıkar
+    full_text = update.message.text.strip()
+    parts = full_text.split(maxsplit=1)
+    date_str = parts[1].strip() if len(parts) > 1 else ""
+
+    if date_str:
         try:
             since_dt = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=timezone.utc)
             period_label = f"{date_str} – şimdi arası"
@@ -555,14 +560,53 @@ async def cmd_sinyal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_istatistik_tarih(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/istatistik_tarih — kullanıcıdan tarih girmesini ister."""
+    user_states[update.effective_user.id] = {"step": "tarih"}
+    await update.message.reply_text(
+        "📅 <b>Tarihten İtibaren İstatistik</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        "Başlangıç tarihini girin:\n"
+        "<i>Örnek: 01.03.2026</i>",
+        parse_mode="HTML"
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in user_states:
         return
 
     state = user_states[uid]
-    text  = update.message.text.strip().upper()
+    text  = update.message.text.strip()
 
+    # ── Tarih adımı ─────────────────────────────────────────────
+    if state["step"] == "tarih":
+        try:
+            since_dt = datetime.strptime(text, "%d.%m.%Y").replace(tzinfo=timezone.utc)
+            period_label = f"{text} – şimdi arası"
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Format hatalı. Tekrar deneyin:\n<i>Örnek: 01.03.2026</i>",
+                parse_mode="HTML"
+            )
+            return  # state'i silme, tekrar girsin
+
+        user_states.pop(uid, None)
+        await update.message.reply_text("⏳ İstatistikler hesaplanıyor...")
+        records = read_stats_log(since_dt)
+        if not records:
+            await update.message.reply_text(
+                f"📭 <b>{period_label}</b> için kayıt bulunamadı.",
+                parse_mode="HTML"
+            )
+            return
+        msg = build_stats_message(records, period_label)
+        await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
+        return
+
+    # ── Coin adımı ──────────────────────────────────────────────
+    text = text.upper()
     if state["step"] == "coin":
         symbol = text.replace(".P", "").replace("USDT", "") + "USDT"
         state["symbol"] = symbol
@@ -1166,8 +1210,9 @@ def run_telegram():
         telegram_app.add_handler(CommandHandler("bakiye",      cmd_bakiye))
         telegram_app.add_handler(CommandHandler("pozisyonlar", cmd_pozisyonlar))
         telegram_app.add_handler(CommandHandler("kapat",       cmd_kapat))
-        telegram_app.add_handler(CommandHandler("sinyal",      cmd_sinyal))
-        telegram_app.add_handler(CommandHandler("istatistik",  cmd_istatistik))   # ← YENİ
+        telegram_app.add_handler(CommandHandler("sinyal",            cmd_sinyal))
+        telegram_app.add_handler(CommandHandler("istatistik",        cmd_istatistik))
+        telegram_app.add_handler(CommandHandler("istatistik_tarih",  cmd_istatistik_tarih))  # ← YENİ
         telegram_app.add_handler(CallbackQueryHandler(handle_callback))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
