@@ -8,7 +8,7 @@ SABİT STRATEJİ:
   TP1 %1.0  → %20 kapat
   TP2 %2.0  → %20 kapat
   TP3 %3.0  → %20 kapat
-  TP4 %4.0  → %20 kapat  + TSL devreye girer (callback %2.0)
+  TP4 %4.0  → %20 kapat  + TSL devreye girer (callback %3.0)
   SL  %2.0  sabit
   Kalan %20 → TSL ile korunur
 """
@@ -21,6 +21,7 @@ import hashlib
 import time
 import threading
 import requests as req
+import websocket
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
 from binance.error import ClientError
@@ -29,6 +30,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
+from datetime import datetime, timezone
 
 # ─── LOGGING ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -49,17 +51,16 @@ PORT             = int(os.getenv("PORT", 5000))
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",     "YOUR_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-# TRADE_PERCENT = 3.0  # Artık kullanılmıyor
 TRADE_USDT_FIXED = 100  # Sabit işlem miktarı (USDT)
 MARGIN_TYPE   = "ISOLATED"
 BASE_URL      = "https://demo-fapi.binance.com"
 
 # ─── SABİT STRATEJİ ─────────────────────────────────────────────
 FIXED_LEVERAGE   = 10
-TP_STEP_PCT      = 1.0    # Her TP bir öncekinden %1.0 uzakta
-SL_PCT           = 2.0    # Stop Loss %2
-TSL_CALLBACK_PCT = 3.0    # Trailing Stop callback %3.0
-TP_QTY_PCT       = 20     # Her TP'de pozisyonun %20'si kapatılır
+TP_STEP_PCT      = 1.0
+SL_PCT           = 2.0
+TSL_CALLBACK_PCT = 3.0
+TP_QTY_PCT       = 20
 
 # ─── BİNANCE CLIENT ─────────────────────────────────────────────
 client = UMFutures(key=API_KEY, secret=API_SECRET, base_url=BASE_URL)
@@ -69,6 +70,226 @@ app = Flask(__name__)
 
 # ─── TELEGRAM UYGULAMA (global) ─────────────────────────────────
 telegram_app = None
+
+# ─── İSTATİSTİK LOG DOSYASI ─────────────────────────────────────
+STATS_LOG_FILE = "trade_stats.jsonl"
+
+
+# ════════════════════════════════════════════════════════════════
+# İSTATİSTİK LOGLAMA FONKSİYONLARI
+# ════════════════════════════════════════════════════════════════
+
+def log_trade_event(event_type: str, symbol: str, side: str, pnl: float = None, extra: dict = None):
+    """
+    Her önemli olayı JSONL dosyasına kaydeder.
+    event_type örnekleri:
+      "OPENED"        → pozisyon açıldı
+      "SL_HIT"        → stop loss tetiklendi
+      "TP1_HIT"       → TP1 tetiklendi (ve sonra SL → TP1+SL)
+      "TP2_HIT"       → TP2 tetiklendi
+      "TP3_HIT"       → TP3 tetiklendi
+      "TP4_HIT"       → TP4 tetiklendi
+      "TSL_ACTIVE"    → TSL devreye girdi
+      "TSL_HIT"       → TSL kapattı
+      "CLOSED_MANUAL" → elle kapatıldı
+      "REVERSED"      → karşı sinyal geldi, pozisyon tersine çevrildi
+    """
+    record = {
+        "ts":    datetime.now(timezone.utc).isoformat(),
+        "event": event_type,
+        "symbol": symbol,
+        "side":   side,
+        "pnl":    pnl,
+    }
+    if extra:
+        record.update(extra)
+    try:
+        with open(STATS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.error(f"İstatistik log yazılamadı: {e}")
+
+
+def read_stats_log(since_dt: datetime) -> list:
+    """since_dt'den itibaren tüm kayıtları döner."""
+    records = []
+    if not os.path.exists(STATS_LOG_FILE):
+        return records
+    try:
+        with open(STATS_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    rec_dt = datetime.fromisoformat(rec["ts"])
+                    if rec_dt.tzinfo is None:
+                        rec_dt = rec_dt.replace(tzinfo=timezone.utc)
+                    if rec_dt >= since_dt:
+                        records.append(rec)
+                except Exception:
+                    continue
+    except Exception as e:
+        log.error(f"İstatistik log okunamadı: {e}")
+    return records
+
+
+def build_stats_message(records: list, period_label: str) -> str:
+    """
+    Kayıtlardan tablodaki gibi istatistik mesajı üretir.
+
+    Kategoriler:
+      açılan        → OPENED
+      stop los      → SL_HIT (TP tetiklenmeden SL)
+      Tp1+SL        → TP1_HIT + SL_HIT aynı trade'de
+      Tp2+SL        → TP2_HIT + SL_HIT
+      Tp3+SL        → TP3_HIT + SL_HIT
+      Tp4+SL        → TP4_HIT + SL_HIT
+      TSL + SL      → TSL_HIT
+      TSL(halen açık) → TSL_ACTIVE (TSL tetiklendi ama pozisyon hâlâ açık)
+      Giriş-Açık    → OPENED ama henüz hiç TP/SL/TSL yok
+      TP1(halen açık) → TP1_HIT ama pozisyon hâlâ açık
+      TP2(halen açık) → TP2_HIT
+      TP3(halen açık) → TP3_HIT
+      TP4(halen açık) → TP4_HIT
+    """
+
+    # trade bazında grupla: symbol + açılış ts ile
+    # Her OPENED bir trade başlatır, sonraki eventler ona bağlanır
+    trades = {}   # key: (symbol, open_ts_str)
+    orphans = []  # OPENED olmadan gelen eventler
+
+    opened_by_symbol = {}  # son açılan trade key'ini tutar per symbol
+
+    for rec in sorted(records, key=lambda r: r["ts"]):
+        sym = rec["symbol"]
+        ev  = rec["event"]
+
+        if ev == "OPENED":
+            key = (sym, rec["ts"])
+            trades[key] = {
+                "symbol": sym,
+                "side":   rec["side"],
+                "open_ts": rec["ts"],
+                "events": ["OPENED"],
+                "pnl":    0.0,
+            }
+            opened_by_symbol[sym] = key
+        else:
+            key = opened_by_symbol.get(sym)
+            if key and key in trades:
+                trades[key]["events"].append(ev)
+                if rec.get("pnl") is not None:
+                    trades[key]["pnl"] = (trades[key]["pnl"] or 0) + rec["pnl"]
+            else:
+                orphans.append(rec)
+
+    # Kategori sayaçları
+    cats = {
+        "açılan":           {"count": 0, "pnl": 0.0},
+        "stop los":         {"count": 0, "pnl": 0.0},
+        "Tp1+SL":           {"count": 0, "pnl": 0.0},
+        "Tp2+SL":           {"count": 0, "pnl": 0.0},
+        "Tp3+SL":           {"count": 0, "pnl": 0.0},
+        "Tp4+SL":           {"count": 0, "pnl": 0.0},
+        "TSL + SL":         {"count": 0, "pnl": 0.0},
+        "TSL(halen açık)":  {"count": 0, "pnl": 0.0},
+        "Giriş-Açık":       {"count": 0, "pnl": 0.0},
+        "TP1(halen açık)":  {"count": 0, "pnl": 0.0},
+        "TP2(halen açık)":  {"count": 0, "pnl": 0.0},
+        "TP3(halen açık)":  {"count": 0, "pnl": 0.0},
+        "TP4(halen açık)":  {"count": 0, "pnl": 0.0},
+    }
+
+    total_opened = len([t for t in trades.values() if "OPENED" in t["events"]])
+
+    for trade in trades.values():
+        evs = trade["events"]
+        pnl = trade["pnl"] or 0.0
+
+        has_tp1 = "TP1_HIT" in evs
+        has_tp2 = "TP2_HIT" in evs
+        has_tp3 = "TP3_HIT" in evs
+        has_tp4 = "TP4_HIT" in evs
+        has_sl  = "SL_HIT"  in evs
+        has_tsl_active = "TSL_ACTIVE" in evs
+        has_tsl_hit    = "TSL_HIT"    in evs
+        is_closed = has_sl or has_tsl_hit or "CLOSED_MANUAL" in evs or "REVERSED" in evs
+
+        # Kapalı pozisyon kategorileri
+        if is_closed:
+            if has_tsl_hit:
+                cats["TSL + SL"]["count"] += 1
+                cats["TSL + SL"]["pnl"]   += pnl
+            elif has_tp4 and has_sl:
+                cats["Tp4+SL"]["count"] += 1
+                cats["Tp4+SL"]["pnl"]   += pnl
+            elif has_tp3 and has_sl:
+                cats["Tp3+SL"]["count"] += 1
+                cats["Tp3+SL"]["pnl"]   += pnl
+            elif has_tp2 and has_sl:
+                cats["Tp2+SL"]["count"] += 1
+                cats["Tp2+SL"]["pnl"]   += pnl
+            elif has_tp1 and has_sl:
+                cats["Tp1+SL"]["count"] += 1
+                cats["Tp1+SL"]["pnl"]   += pnl
+            elif has_sl:
+                cats["stop los"]["count"] += 1
+                cats["stop los"]["pnl"]   += pnl
+        else:
+            # Hâlâ açık pozisyon kategorileri
+            if has_tsl_active:
+                cats["TSL(halen açık)"]["count"] += 1
+                cats["TSL(halen açık)"]["pnl"]   += pnl
+            elif has_tp4:
+                cats["TP4(halen açık)"]["count"] += 1
+                cats["TP4(halen açık)"]["pnl"]   += pnl
+            elif has_tp3:
+                cats["TP3(halen açık)"]["count"] += 1
+                cats["TP3(halen açık)"]["pnl"]   += pnl
+            elif has_tp2:
+                cats["TP2(halen açık)"]["count"] += 1
+                cats["TP2(halen açık)"]["pnl"]   += pnl
+            elif has_tp1:
+                cats["TP1(halen açık)"]["count"] += 1
+                cats["TP1(halen açık)"]["pnl"]   += pnl
+            else:
+                cats["Giriş-Açık"]["count"] += 1
+                cats["Giriş-Açık"]["pnl"]   += pnl
+
+    cats["açılan"]["count"] = total_opened
+    cats["açılan"]["pnl"]   = sum(t["pnl"] or 0 for t in trades.values())
+
+    total_pnl = sum(
+        v["pnl"] for k, v in cats.items()
+        if k not in ("açılan",)
+    )
+
+    # Mesaj oluştur
+    lines = [
+        f"📊 <b>İSTATİSTİK — {period_label}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"{'Kategori':<20} {'Adet':>5} {'Kazanç(USD)':>12}",
+        "─────────────────────────────────",
+    ]
+
+    row_order = [
+        "açılan", "stop los",
+        "Tp1+SL", "Tp2+SL", "Tp3+SL", "Tp4+SL",
+        "TSL + SL", "TSL(halen açık)", "Giriş-Açık",
+        "TP1(halen açık)", "TP2(halen açık)", "TP3(halen açık)", "TP4(halen açık)",
+    ]
+
+    for cat in row_order:
+        v = cats[cat]
+        pnl_str = f"{v['pnl']:+.2f}" if v["pnl"] != 0 else "0"
+        lines.append(f"{cat:<20} {v['count']:>5} {pnl_str:>12}")
+
+    lines.append("─────────────────────────────────")
+    lines.append(f"{'TOPLAM PNL':<20} {'':>5} {total_pnl:>+.2f}")
+
+    return "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -165,6 +386,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pozisyonlar — Açık pozisyonları göster\n"
         "/kapat [COIN] — Pozisyon kapat\n"
         "/bakiye — USDT bakiyesi\n"
+        "/istatistik — Son 24 saatin özeti\n"
+        "/istatistik 01.03.2026 — Tarihten itibaren özet\n"
         "/yardim — Bu menü\n"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
@@ -253,12 +476,57 @@ async def _close_position(update, symbol):
 
         pnl = float(pos.get("unRealizedProfit", 0))
         notify_position_closed(symbol, "BUY" if amt > 0 else "SELL", pnl)
+
+        # İstatistik logu
+        log_trade_event("CLOSED_MANUAL", symbol, "BUY" if amt > 0 else "SELL", pnl=pnl)
+
         await update.message.reply_text(
             f"✅ <b>{symbol}</b> kapatıldı (tüm emirler iptal edildi)\n💵 PnL: {pnl:.2f} USDT",
             parse_mode="HTML"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ {symbol} kapatılamadı: {e}")
+
+
+# ─── İSTATİSTİK KOMUTU ──────────────────────────────────────────
+
+async def cmd_istatistik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Kullanım:
+      /istatistik           → son 24 saat
+      /istatistik 01.03.2026 → o tarihten (00:00 UTC) itibaren
+    """
+    now = datetime.now(timezone.utc)
+
+    if context.args:
+        date_str = context.args[0]
+        try:
+            since_dt = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=timezone.utc)
+            period_label = f"{date_str} – şimdi arası"
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Tarih formatı hatalı.\n"
+                "Doğru format: /istatistik 01.03.2026"
+            )
+            return
+    else:
+        from datetime import timedelta
+        since_dt = now - timedelta(hours=24)
+        period_label = "Son 24 saat"
+
+    await update.message.reply_text("⏳ İstatistikler hesaplanıyor...")
+
+    records = read_stats_log(since_dt)
+
+    if not records:
+        await update.message.reply_text(
+            f"📭 <b>{period_label}</b> için kayıt bulunamadı.",
+            parse_mode="HTML"
+        )
+        return
+
+    msg = build_stats_message(records, period_label)
+    await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
 
 
 # ─── MANUEL SİNYAL ──────────────────────────────────────────────
@@ -439,7 +707,6 @@ def get_open_position(symbol):
 
 
 def get_symbol_info(symbol):
-    """Returns: (price_precision, qty_precision, tick_size)"""
     try:
         info = client.exchange_info()
         for s in info["symbols"]:
@@ -536,12 +803,8 @@ def set_margin_type(symbol):
             log.error(f"Margin tipi ayarlanamadı: {e}")
 
 
-TRADE_USDT_FIXED = 100  # Sabit 100 USDT marjin
-
 def calculate_quantity(symbol, leverage, price, qty_precision):
-    # balance    = get_usdt_balance()
-    # trade_usdt = balance * (TRADE_PERCENT / 100) * leverage
-    trade_usdt = TRADE_USDT_FIXED * leverage  # Sabit 100 USDT marjin
+    trade_usdt = TRADE_USDT_FIXED * leverage
     quantity   = trade_usdt / price
     quantity   = round(quantity, qty_precision)
     log.info(f"Sabit işlem: {TRADE_USDT_FIXED} USDT marjin | {trade_usdt:.2f} USDT pozisyon | Miktar: {quantity}")
@@ -574,7 +837,6 @@ def place_algo_order(params, label="Emir"):
 
 
 def cancel_all_orders(symbol):
-    """Tüm emirleri (normal + algo TP/SL/TSL) iptal eder."""
     from urllib.parse import urlencode
 
     def hashing(query_string):
@@ -605,14 +867,12 @@ def cancel_all_orders(symbol):
         response = dispatch_request(http_method)(**params)
         return response.json()
 
-    # 1. Normal emirleri iptal et
     try:
         r = send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
         log.info(f"{symbol} allOpenOrders iptal: {r}")
     except Exception as e:
         log.warning(f"{symbol} allOpenOrders iptal hatası: {e}")
 
-    # 2. TSL için algoOpenOrders iptal et
     try:
         r = send_signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
         log.info(f"{symbol} algoOpenOrders iptal: {r}")
@@ -713,6 +973,9 @@ def close_existing_position(symbol, existing_pos):
 
         cancel_all_orders(symbol)
 
+        # İstatistik logu
+        log_trade_event("REVERSED", symbol, old_side, pnl=pnl)
+
         return old_side, pnl
 
     except ClientError as e:
@@ -792,8 +1055,48 @@ def process_signal(data: dict) -> dict:
 
     notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price)
 
+    # ── İstatistik logu: pozisyon açıldı ───────────────────────
+    log_trade_event("OPENED", symbol, side, extra={
+        "entry_price": entry_price,
+        "leverage":    valid_leverage,
+        "tp_prices":   tp_prices,
+        "sl_price":    sl_price,
+    })
+
     log.info(f"✅ {symbol} {side} tamamlandı | {valid_leverage}x | Giriş: {entry_price}")
     return {"status": "ok", "symbol": symbol, "side": side, "leverage": valid_leverage}
+
+
+# ════════════════════════════════════════════════════════════════
+# WEBHOOK — TP/SL/TSL CALLBACK ENDPOINT'İ
+# (Binance algo emirleri tetiklendiğinde buraya POST atar — opsiyonel)
+# ════════════════════════════════════════════════════════════════
+
+@app.route("/algo_callback", methods=["POST"])
+def algo_callback():
+    """
+    Binance'in algo emir callback'i (eğer URL ayarladıysanız).
+    Gelen veriyi parse edip istatistik loguna yazar.
+    Kullanmıyorsanız bu endpoint'i görmezden gelin.
+    """
+    try:
+        data   = request.get_json(force=True)
+        symbol = data.get("s", "")
+        etype  = data.get("X", "")   # ORDER_TYPE: TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET
+        side   = data.get("S", "")   # BUY / SELL
+        pnl    = float(data.get("rp", 0) or 0)
+
+        event_map = {
+            "TAKE_PROFIT_MARKET": "TP_HIT",
+            "STOP_MARKET":        "SL_HIT",
+            "TRAILING_STOP_MARKET": "TSL_HIT",
+        }
+        ev = event_map.get(etype, etype)
+        log_trade_event(ev, symbol, side, pnl=pnl, extra={"raw": data})
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        log.error(f"algo_callback hatası: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════════
@@ -851,6 +1154,7 @@ def run_telegram():
         telegram_app.add_handler(CommandHandler("pozisyonlar", cmd_pozisyonlar))
         telegram_app.add_handler(CommandHandler("kapat",       cmd_kapat))
         telegram_app.add_handler(CommandHandler("sinyal",      cmd_sinyal))
+        telegram_app.add_handler(CommandHandler("istatistik",  cmd_istatistik))   # ← YENİ
         telegram_app.add_handler(CallbackQueryHandler(handle_callback))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -866,6 +1170,118 @@ def run_telegram():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main())
+
+
+# ════════════════════════════════════════════════════════════════
+# USER DATA STREAM — TP/SL/TSL TETİKLENME DİNLEYİCİSİ
+# ════════════════════════════════════════════════════════════════
+
+WS_BASE = "wss://fstream.binance.com/ws/"
+# Demo hesap kullanıyorsan yukarıdaki satırı şununla değiştir:
+# WS_BASE = "wss://stream.binancefuture.com/ws/"
+
+def get_listen_key():
+    r = req.post(
+        f"{BASE_URL}/fapi/v1/listenKey",
+        headers={"X-MBX-APIKEY": API_KEY},
+        timeout=10
+    )
+    return r.json().get("listenKey")
+
+
+def keepalive_listen_key(listen_key):
+    """Her 30 dakikada bir listen key'i yenile."""
+    while True:
+        time.sleep(30 * 60)
+        try:
+            req.put(
+                f"{BASE_URL}/fapi/v1/listenKey",
+                headers={"X-MBX-APIKEY": API_KEY},
+                params={"listenKey": listen_key},
+                timeout=10
+            )
+            log.info("Listen key yenilendi.")
+        except Exception as e:
+            log.error(f"Listen key yenilenemedi: {e}")
+
+
+def on_order_event(msg: dict):
+    """TP / SL / TSL tetiklendiğinde çağrılır."""
+    if msg.get("e") != "ORDER_TRADE_UPDATE":
+        return
+
+    order  = msg.get("o", {})
+    status = order.get("X")           # FILLED, CANCELED, NEW ...
+    otype  = order.get("ot")          # emir tipi
+    symbol = order.get("s", "")
+    side   = order.get("S", "")       # BUY / SELL
+    pnl    = float(order.get("rp", 0) or 0)
+
+    if status != "FILLED":
+        return
+
+    event_map = {
+        "TAKE_PROFIT_MARKET":   "TP_HIT",
+        "STOP_MARKET":          "SL_HIT",
+        "TRAILING_STOP_MARKET": "TSL_HIT",
+    }
+    ev = event_map.get(otype)
+    if not ev:
+        return
+
+    log.info(f"📥 {ev} tetiklendi → {symbol} {side} PnL={pnl:.2f}")
+    log_trade_event(ev, symbol, side, pnl=pnl)
+
+    emoji = {"TP_HIT": "🎯", "SL_HIT": "🔴", "TSL_HIT": "📉"}.get(ev, "ℹ️")
+    label = {"TP_HIT": "TAKE PROFIT", "SL_HIT": "STOP LOSS", "TSL_HIT": "TRAILING STOP"}.get(ev, ev)
+    send_telegram(
+        f"{emoji} <b>{label} TETİKLENDİ</b>\n"
+        f"📌 {symbol}\n"
+        f"💵 PnL: {pnl:+.2f} USDT\n"
+        f"🕐 {time.strftime('%H:%M:%S')}"
+    )
+
+
+def run_user_stream():
+    """User Data Stream WebSocket'i başlat, kopunca yeniden bağlan."""
+    while True:
+        try:
+            listen_key = get_listen_key()
+            if not listen_key:
+                log.error("Listen key alınamadı, 30sn sonra tekrar denenecek.")
+                time.sleep(30)
+                continue
+
+            log.info(f"📡 User Data Stream bağlandı. key={listen_key[:10]}...")
+
+            threading.Thread(
+                target=keepalive_listen_key, args=(listen_key,), daemon=True
+            ).start()
+
+            def on_message(ws, message):
+                try:
+                    on_order_event(json.loads(message))
+                except Exception as e:
+                    log.error(f"WS mesaj hatası: {e}")
+
+            def on_error(ws, error):
+                log.error(f"WS hata: {error}")
+
+            def on_close(ws, *args):
+                log.warning("WS kapandı, yeniden bağlanılıyor...")
+
+            ws = websocket.WebSocketApp(
+                WS_BASE + listen_key,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+            ws.run_forever(ping_interval=60, ping_timeout=10)
+
+        except Exception as e:
+            log.error(f"User stream hatası: {e}")
+
+        time.sleep(5)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -886,6 +1302,10 @@ if __name__ == "__main__":
         )
     else:
         log.warning("TELEGRAM_TOKEN tanımlı değil, Telegram devre dışı.")
+
+    # ── User Data Stream başlat (TP/SL/TSL dinleyici) ──────────
+    ws_thread = threading.Thread(target=run_user_stream, daemon=True)
+    ws_thread.start()
 
     log.info(f"📡 Webhook dinleniyor: http://0.0.0.0:{PORT}/webhook")
     app.run(host="0.0.0.0", port=PORT, debug=False)
