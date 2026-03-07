@@ -61,7 +61,7 @@ PORT             = int(os.getenv("PORT", 5000))
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",     "YOUR_TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID",   "YOUR_CHAT_ID")
 
-TRADE_USDT_FIXED = 100  # Sabit işlem miktarı (USDT)
+TRADE_USDT_PCT   = 3    # Sermayenin %3'ü kadar marjin kullan
 MARGIN_TYPE   = "ISOLATED"
 BASE_URL      = "https://demo-fapi.binance.com"
 
@@ -298,18 +298,29 @@ def build_stats_message(records: list, period_label: str) -> str:
     trades = {}
     opened_by_symbol = {}
 
+    CLOSE_EVENTS = {"SL_HIT", "TSL_HIT", "CLOSED_MANUAL", "REVERSED"}
+
     for rec in sorted(records, key=lambda r: r["ts"]):
         sym = rec["symbol"]
         ev  = rec["event"]
 
         if ev == "OPENED":
+            # Eğer aynı sembolde kapatılmamış işlem varsa, önce onu kapat
+            prev_key = opened_by_symbol.get(sym)
+            if prev_key and prev_key in trades:
+                prev_evs = trades[prev_key]["events"]
+                already_closed = any(e in CLOSE_EVENTS for e in prev_evs)
+                if not already_closed:
+                    # Kapatılmamış işlemi REVERSED olarak işaretle
+                    trades[prev_key]["events"].append("REVERSED")
+
             key = (sym, rec["ts"])
             trades[key] = {
-                "symbol": sym,
-                "side":   rec["side"],
+                "symbol":  sym,
+                "side":    rec["side"],
                 "open_ts": rec["ts"],
-                "events": ["OPENED"],
-                "pnl":    0.0,
+                "events":  ["OPENED"],
+                "pnl":     0.0,
             }
             opened_by_symbol[sym] = key
         else:
@@ -318,14 +329,17 @@ def build_stats_message(records: list, period_label: str) -> str:
                 trades[key]["events"].append(ev)
                 if rec.get("pnl") is not None:
                     trades[key]["pnl"] = (trades[key]["pnl"] or 0) + rec["pnl"]
+                # Kapatma eventi geldiyse bu sembolün aktif işlemini temizle
+                if ev in CLOSE_EVENTS:
+                    opened_by_symbol.pop(sym, None)
             else:
                 key = (sym, rec["ts"])
                 trades[key] = {
-                    "symbol": sym,
-                    "side":   rec["side"],
+                    "symbol":  sym,
+                    "side":    rec["side"],
                     "open_ts": rec["ts"],
-                    "events": ["OPENED", ev],
-                    "pnl":    rec.get("pnl") or 0.0,
+                    "events":  ["OPENED", ev],
+                    "pnl":     rec.get("pnl") or 0.0,
                 }
                 opened_by_symbol[sym] = key
 
@@ -1110,7 +1124,11 @@ def set_margin_type(symbol):
 
 
 def calculate_quantity(symbol, leverage, price, qty_precision, max_qty=None):
-    trade_usdt = TRADE_USDT_FIXED * leverage
+    trade_usdt = round(get_usdt_balance() * (TRADE_USDT_PCT / 100), 2)
+    if trade_usdt <= 0:
+        log.error("Bakiye alınamadı veya sıfır, işlem açılamıyor.")
+        return 0
+    trade_usdt = trade_usdt * leverage
     quantity   = trade_usdt / price
     quantity   = round(quantity, qty_precision)
     # Sembolün izin verdiği maksimum miktarı aşma
@@ -1121,7 +1139,7 @@ def calculate_quantity(symbol, leverage, price, qty_precision, max_qty=None):
         )
         quantity = round(max_qty, qty_precision)
     log.info(
-        f"Sabit işlem: {TRADE_USDT_FIXED} USDT marjin | "
+        f"Sermaye %{TRADE_USDT_PCT} marjin | "
         f"{trade_usdt:.2f} USDT pozisyon | Miktar: {quantity}"
         + (f" (maxQty={max_qty})" if max_qty and quantity >= max_qty else "")
     )
