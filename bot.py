@@ -58,7 +58,7 @@ BASE_URL      = "https://demo-fapi.binance.com"
 FIXED_LEVERAGE   = 10
 TP_STEP_PCT      = 1.0    # Her TP bir öncekinden %1.0 uzakta
 SL_PCT           = 2.0    # Stop Loss %2
-TSL_CALLBACK_PCT = 3.0    # Trailing Stop callback %2.0
+TSL_CALLBACK_PCT = 3.0    # Trailing Stop callback %3.0
 TP_QTY_PCT       = 20     # Her TP'de pozisyonun %20'si kapatılır
 
 # ─── BİNANCE CLIENT ─────────────────────────────────────────────
