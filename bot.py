@@ -1300,17 +1300,33 @@ def keepalive_listen_key(listen_key):
 
 def on_order_event(msg: dict):
     """TP / SL / TSL tetiklendiğinde çağrılır."""
-    if msg.get("e") != "ORDER_TRADE_UPDATE":
-        return
+    event_type = msg.get("e")
 
-    order  = msg.get("o", {})
-    status = order.get("X")           # FILLED, CANCELED, NEW ...
-    otype  = order.get("ot")          # emir tipi
-    symbol = order.get("s", "")
-    side   = order.get("S", "")       # BUY / SELL
-    pnl    = float(order.get("rp", 0) or 0)
+    # Demo hesap: ALGO_UPDATE eventi
+    if event_type == "ALGO_UPDATE":
+        order  = msg.get("o", {})
+        status = order.get("X")           # TRIGGERED, TRIGGERING, CANCELLED ...
+        otype  = order.get("o")           # TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET
+        symbol = order.get("s", "")
+        side   = order.get("S", "")
+        pnl    = float(order.get("rp", 0) or 0)
 
-    if status != "FILLED":
+        if status != "TRIGGERED":
+            return
+
+    # Canlı hesap: ORDER_TRADE_UPDATE eventi
+    elif event_type == "ORDER_TRADE_UPDATE":
+        order  = msg.get("o", {})
+        status = order.get("X")
+        otype  = order.get("ot")
+        symbol = order.get("s", "")
+        side   = order.get("S", "")
+        pnl    = float(order.get("rp", 0) or 0)
+
+        if status != "FILLED":
+            return
+
+    else:
         return
 
     event_map = {
