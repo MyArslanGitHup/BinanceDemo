@@ -5,12 +5,20 @@ TradingView webhook → Binance Futures işlem açma botu
 
 SABİT STRATEJİ:
   Kaldıraç : 5x
-  ATR bazlı dinamik TP/SL:
+  ATR bazlı dinamik TP/SL (ATR, sinyalin geldiği TradingView timeframe'inde hesaplanır):
     ATR <1.5%  → DAR  : SL %1.0, TP [1,2,3,4]%,   TSL %1.0
     ATR 1.5-3% → ORTA : SL %2.0, TP [2,4,6,8]%,   TSL %1.5
     ATR >3.0%  → GENİŞ: SL %3.5, TP [3,6,9,12]%,  TSL %3.0
   Her TP seviyesinde %20 kapat (4 TP = %80)
   Kalan %20 → TSL ile korunur
+
+TradingView alert mesajı örneği:
+  {
+    "secret":    "{{strategy.order.alert_message}}",
+    "symbol":    "{{ticker}}",
+    "side":      "{{strategy.order.action}}",
+    "timeframe": "{{interval}}"
+  }
 """
 
 import os
@@ -67,8 +75,8 @@ ATR_REGIMES = {
     "orta":  {"sl": 2.0, "tps": [2, 4, 6, 8],    "tsl": 1.5},
     "genis": {"sl": 3.5, "tps": [3, 6, 9, 12],   "tsl": 3.0},
 }
-ATR_PERIOD = 14   # ATR hesaplama periyodu (mum sayısı)
-ATR_KLINE_INTERVAL = "1h"  # ATR için kullanılan mum aralığı
+ATR_PERIOD          = 14    # ATR hesaplama periyodu (mum sayısı)
+ATR_FALLBACK_TF     = "1h"  # TradingView timeframe gelmezse kullanılacak varsayılan
 
 # ─── BİNANCE CLIENT ─────────────────────────────────────────────
 client = UMFutures(key=API_KEY, secret=API_SECRET, base_url=BASE_URL)
@@ -112,27 +120,75 @@ def init_db():
 
 
 # ════════════════════════════════════════════════════════════════
+# TradingView → Binance TIMEFRAME DÖNÜŞÜMÜ
+# ════════════════════════════════════════════════════════════════
+
+# TradingView {{interval}} değeri → Binance klines interval
+TV_TO_BINANCE_TF = {
+    # Dakika bazlı
+    "1":    "1m",
+    "3":    "3m",
+    "5":    "5m",
+    "10":   "15m",   # Binance'de 10m yok, 15m'ye yuvarla
+    "15":   "15m",
+    "30":   "30m",
+    "45":   "1h",    # Binance'de 45m yok, 1h'ye yuvarla
+    # Saat bazlı
+    "60":   "1h",
+    "120":  "2h",
+    "180":  "4h",    # Binance'de 3h yok, 4h'ye yuvarla
+    "240":  "4h",
+    "360":  "6h",
+    "480":  "8h",
+    "720":  "12h",
+    # Gün / hafta / ay
+    "1D":   "1d",
+    "D":    "1d",
+    "1W":   "1w",
+    "W":    "1w",
+    "1M":   "1M",
+    "M":    "1M",
+}
+
+def tv_interval_to_binance(tv_interval: str) -> str:
+    """
+    TradingView {{interval}} değerini Binance klines interval formatına çevirir.
+    Tanınmayan değer gelirse ATR_FALLBACK_TF döner.
+    """
+    if not tv_interval:
+        return ATR_FALLBACK_TF
+    mapped = TV_TO_BINANCE_TF.get(str(tv_interval).strip())
+    if mapped:
+        return mapped
+    # Zaten Binance formatında geldiyse (örn: "1h") doğrudan kullan
+    valid_binance = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"}
+    if tv_interval in valid_binance:
+        return tv_interval
+    log.warning(f"Bilinmeyen TradingView interval '{tv_interval}', fallback: {ATR_FALLBACK_TF}")
+    return ATR_FALLBACK_TF
+
+
+# ════════════════════════════════════════════════════════════════
 # ATR HESAPLAMA
 # ════════════════════════════════════════════════════════════════
 
-def get_atr_pct(symbol: str, period: int = ATR_PERIOD, interval: str = ATR_KLINE_INTERVAL) -> float:
+def get_atr_pct(symbol: str, interval: str, period: int = ATR_PERIOD) -> float:
     """
-    Son `period` mumu kullanarak ATR hesaplar ve güncel fiyata
-    oranını yüzde olarak döner.
+    Verilen Binance interval'da son `period` mumu kullanarak ATR hesaplar
+    ve güncel fiyata oranını yüzde olarak döner.
     Hata durumunda None döner.
     """
     try:
         limit  = period + 1
         klines = client.klines(symbol=symbol, interval=interval, limit=limit)
         if len(klines) < period + 1:
-            log.warning(f"{symbol} ATR için yeterli mum yok ({len(klines)})")
+            log.warning(f"{symbol} ATR için yeterli mum yok ({len(klines)}) [{interval}]")
             return None
 
         highs  = [float(k[2]) for k in klines]
         lows   = [float(k[3]) for k in klines]
         closes = [float(k[4]) for k in klines]
 
-        # True Range listesi
         true_ranges = []
         for i in range(1, len(klines)):
             h  = highs[i]
@@ -145,11 +201,11 @@ def get_atr_pct(symbol: str, period: int = ATR_PERIOD, interval: str = ATR_KLINE
         cur_price = closes[-1]
         atr_pct   = (atr / cur_price) * 100
 
-        log.info(f"{symbol} ATR={atr:.6f}, Fiyat={cur_price:.6f}, ATR%={atr_pct:.3f}%")
+        log.info(f"{symbol} [{interval}] ATR={atr:.6f}, Fiyat={cur_price:.6f}, ATR%={atr_pct:.3f}%")
         return atr_pct
 
     except Exception as e:
-        log.error(f"{symbol} ATR hesaplama hatası: {e}")
+        log.error(f"{symbol} ATR hesaplama hatası [{interval}]: {e}")
         return None
 
 
@@ -163,26 +219,31 @@ def get_regime(atr_pct: float) -> str:
         return "genis"
 
 
-def get_strategy_params(symbol: str) -> dict:
+def get_strategy_params(symbol: str, tv_interval: str = "") -> dict:
     """
-    Sembol için ATR hesaplar, rejimi belirler ve strateji
-    parametrelerini döner.
+    TradingView'dan gelen interval'ı Binance formatına çevirip ATR hesaplar,
+    rejimi belirler ve strateji parametrelerini döner.
     ATR hesaplanamadığında güvenli varsayılan olarak 'orta' kullanılır.
     """
-    atr_pct = get_atr_pct(symbol)
+    binance_interval = tv_interval_to_binance(tv_interval)
+    log.info(f"{symbol} ATR interval: TV='{tv_interval}' → Binance='{binance_interval}'")
+
+    atr_pct = get_atr_pct(symbol, interval=binance_interval)
     if atr_pct is None:
         regime = "orta"
-        log.warning(f"{symbol} ATR alınamadı, varsayılan rejim: {regime}")
+        log.warning(f"{symbol} ATR alınamadı [{binance_interval}], varsayılan rejim: {regime}")
     else:
         regime = get_regime(atr_pct)
 
     params = ATR_REGIMES[regime].copy()
-    params["regime"]  = regime
-    params["atr_pct"] = atr_pct
+    params["regime"]           = regime
+    params["atr_pct"]          = atr_pct
+    params["binance_interval"] = binance_interval
+    params["tv_interval"]      = tv_interval or ATR_FALLBACK_TF
 
     log.info(
         f"{symbol} Rejim={regime.upper()} | "
-        f"ATR%={atr_pct:.3f}% | "
+        f"ATR%={atr_pct:.3f}% [{binance_interval}] | "
         f"SL={params['sl']}% | "
         f"TPs={params['tps']} | "
         f"TSL={params['tsl']}%"
@@ -1193,7 +1254,9 @@ def process_signal(data: dict) -> dict:
         time.sleep(1)
 
     # ── ATR bazlı strateji parametrelerini belirle ──────────────
-    strategy     = get_strategy_params(symbol)
+    # TradingView {{interval}} değeri webhook'tan okunur
+    tv_interval  = data.get("timeframe", "")
+    strategy     = get_strategy_params(symbol, tv_interval=tv_interval)
     regime       = strategy["regime"]
     sl_pct       = strategy["sl"]
     tp_pcts      = strategy["tps"]          # [1,2,3,4] veya [2,4,6,8] veya [3,6,9,12]
