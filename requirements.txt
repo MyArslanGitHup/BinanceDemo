@@ -4,3 +4,4 @@ python-dotenv==1.0.1
 python-telegram-bot==21.5
 requests==2.31.0
 websocket-client
+psycopg2-binary
