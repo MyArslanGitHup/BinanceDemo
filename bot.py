@@ -650,7 +650,7 @@ async def _close_position(update, symbol):
         amt   = float(pos["positionAmt"])
         side  = "SELL" if amt > 0 else "BUY"
         qty   = abs(amt)
-        _, qty_precision, _ = get_symbol_info(symbol)
+        _, qty_precision, _, _ = get_symbol_info(symbol)
         qty   = round(qty, qty_precision)
 
         client.new_order(
@@ -802,7 +802,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["step"] = "confirm"
 
         current_price = get_current_price(state["symbol"])
-        _, _, tick_size = get_symbol_info(state["symbol"])
+        _, _, tick_size, _ = get_symbol_info(state["symbol"])
 
         # ATR bazlı strateji parametrelerini al
         strategy = get_strategy_params(state["symbol"])
@@ -945,24 +945,36 @@ def get_open_position(symbol):
 
 
 def get_symbol_info(symbol):
+    """
+    Döner: (price_precision, qty_precision, tick_size, max_qty)
+    max_qty → LOT_SIZE filtresinden alınan maksimum emir miktarı.
+    Bulunamazsa None döner (sınırsız kabul edilir).
+    """
     try:
         info = client.exchange_info()
         for s in info["symbols"]:
             if s["symbol"] == symbol:
                 tick_size = 0.01
                 step_size = 0.001
+                max_qty   = None
                 for f in s.get("filters", []):
                     if f["filterType"] == "PRICE_FILTER":
                         tick_size = float(f["tickSize"])
                     if f["filterType"] == "LOT_SIZE":
                         step_size = float(f["stepSize"])
+                        raw_max   = f.get("maxQty") or f.get("maxQuantity")
+                        if raw_max:
+                            max_qty = float(raw_max)
                 step_str      = f"{step_size:.10f}".rstrip("0")
                 qty_precision = len(step_str.split(".")[1]) if "." in step_str else 0
-                log.info(f"{symbol} tickSize={tick_size}, stepSize={step_size}, qtyPrecision={qty_precision}")
-                return s["pricePrecision"], qty_precision, tick_size
+                log.info(
+                    f"{symbol} tickSize={tick_size}, stepSize={step_size}, "
+                    f"qtyPrecision={qty_precision}, maxQty={max_qty}"
+                )
+                return s["pricePrecision"], qty_precision, tick_size, max_qty
     except ClientError as e:
         log.error(f"Sembol bilgisi alınamadı: {e}")
-    return 2, 3, 0.01
+    return 2, 3, 0.01, None
 
 
 def round_to_tick(price: float, tick_size: float) -> float:
@@ -1041,11 +1053,22 @@ def set_margin_type(symbol):
             log.error(f"Margin tipi ayarlanamadı: {e}")
 
 
-def calculate_quantity(symbol, leverage, price, qty_precision):
+def calculate_quantity(symbol, leverage, price, qty_precision, max_qty=None):
     trade_usdt = TRADE_USDT_FIXED * leverage
     quantity   = trade_usdt / price
     quantity   = round(quantity, qty_precision)
-    log.info(f"Sabit işlem: {TRADE_USDT_FIXED} USDT marjin | {trade_usdt:.2f} USDT pozisyon | Miktar: {quantity}")
+    # Sembolün izin verdiği maksimum miktarı aşma
+    if max_qty is not None and quantity > max_qty:
+        log.warning(
+            f"{symbol} hesaplanan miktar {quantity} > maxQty {max_qty}, "
+            f"maxQty'ye kırpılıyor."
+        )
+        quantity = round(max_qty, qty_precision)
+    log.info(
+        f"Sabit işlem: {TRADE_USDT_FIXED} USDT marjin | "
+        f"{trade_usdt:.2f} USDT pozisyon | Miktar: {quantity}"
+        + (f" (maxQty={max_qty})" if max_qty and quantity >= max_qty else "")
+    )
     return quantity
 
 
@@ -1200,7 +1223,7 @@ def close_existing_position(symbol, existing_pos):
         amt      = float(existing_pos["positionAmt"])
         side     = "SELL" if amt > 0 else "BUY"
         qty      = abs(amt)
-        _, qty_precision, _ = get_symbol_info(symbol)
+        _, qty_precision, _, _ = get_symbol_info(symbol)
         qty      = round(qty, qty_precision)
         pnl      = float(existing_pos.get("unRealizedProfit", 0))
         old_side = "BUY" if amt > 0 else "SELL"
@@ -1255,7 +1278,15 @@ def process_signal(data: dict) -> dict:
 
     # ── ATR bazlı strateji parametrelerini belirle ──────────────
     # TradingView {{interval}} değeri webhook'tan okunur
-    tv_interval  = data.get("timeframe", "")
+    tv_interval = data.get("timeframe", "")
+    # TradingView template değişkeni çözümlenmemişse uyar
+    if "{{" in tv_interval:
+        log.warning(
+            f"timeframe alanı çözümlenmemiş TradingView şablonu içeriyor: '{tv_interval}'. "
+            f"Alert mesajını TradingView'da Pine Script değil, düz JSON olarak giriniz. "
+            f"Fallback: {ATR_FALLBACK_TF}"
+        )
+        tv_interval = ""
     strategy     = get_strategy_params(symbol, tv_interval=tv_interval)
     regime       = strategy["regime"]
     sl_pct       = strategy["sl"]
@@ -1264,7 +1295,7 @@ def process_signal(data: dict) -> dict:
     atr_pct      = strategy["atr_pct"]
 
     # ── Sembol bilgisi ──────────────────────────────────────────
-    price_precision, qty_precision, tick_size = get_symbol_info(symbol)
+    price_precision, qty_precision, tick_size, max_qty = get_symbol_info(symbol)
     current_price = get_current_price(symbol)
     if current_price == 0:
         return {"error": "Fiyat alınamadı"}
@@ -1275,7 +1306,7 @@ def process_signal(data: dict) -> dict:
     valid_leverage = FIXED_LEVERAGE
 
     # ── Miktar ─────────────────────────────────────────────────
-    quantity = calculate_quantity(symbol, valid_leverage, current_price, qty_precision)
+    quantity = calculate_quantity(symbol, valid_leverage, current_price, qty_precision, max_qty)
     if quantity <= 0:
         return {"error": "Yetersiz bakiye"}
 
