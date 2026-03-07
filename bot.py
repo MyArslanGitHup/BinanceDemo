@@ -6,9 +6,9 @@ TradingView webhook → Binance Futures işlem açma botu
 SABİT STRATEJİ:
   Kaldıraç : 5x
   ATR bazlı dinamik TP/SL (ATR, sinyalin geldiği TradingView timeframe'inde hesaplanır):
-    ATR <1.5%  → DAR  : SL %1.0, TP [0.5,1,1.5,2]%,  TSL %1.0
-    ATR 1.5-3% → ORTA : SL %2.0, TP [1,2,3,4]%,      TSL %2.0
-    ATR >3.0%  → GENİŞ: SL %4.0, TP [2,4,6,8]%,      TSL %4.0
+    ATR <1.5%  → DAR  : SL %1.0, TP [0.5,1,1.5,2]%,  TSL %2.0
+    ATR 1.5-3% → ORTA : SL %2.0, TP [1,2,3,4]%,      TSL %4.0
+    ATR >3.0%  → GENİŞ: SL %4.0, TP [2,4,6,8]%,      TSL %6.0
   TP miktarları: TP1=%30, TP2=%20, TP3=%20, TP4=%20 (toplam %90)
   Kalan %10 → TSL ile korunur
 
