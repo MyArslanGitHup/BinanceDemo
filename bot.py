@@ -467,7 +467,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Claude Trading Bot</b>\n"
         "━━━━━━━━━━━━━━━\n"
         f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP | TSL Dinamik\n"
-        f"📈 ATR &lt;{ATR_MID_PCT}% → DAR | {ATR_MID_PCT}-{ATR_HIGH_PCT}% → ORTA | &gt;{ATR_HIGH_PCT}% → GENİŞ\n"
+        f"📈 ATR %{ATR_MID_PCT} altı → DAR | %{ATR_MID_PCT}-{ATR_HIGH_PCT} → ORTA | %{ATR_HIGH_PCT} üstü → GENİŞ\n"
         "━━━━━━━━━━━━━━━\n"
         "📋 <b>Komutlar:</b>\n\n"
         "/sinyal — Manuel sinyal gönder\n"
@@ -494,100 +494,263 @@ async def cmd_bakiye(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_atr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/atr BTCUSDT — Coin'in ATR% ve strateji tipini gösterir."""
     if not context.args:
-        await update.message.reply_text(
-            "⚠️ Kullanım: /atr BTCUSDT\nveya /atr BTC"
-        )
+        await update.message.reply_text("⚠️ Kullanım: /atr BTCUSDT\nveya /atr BTC")
         return
 
     raw = context.args[0].upper().replace(".P", "").replace("USDT", "") + "USDT"
     atr_pct  = get_atr_percent(raw)
-    strategy = select_strategy(atr_pct)
 
     if atr_pct < 0:
         await update.message.reply_text(f"❌ {raw} için ATR alınamadı.")
         return
 
-    log.info(f"{symbol} strateji: {strategy['label']} | SL:{strategy['sl']} TP:{strategy['tps']} TSL:{strategy['tsl']}")
-
-    # ── Açık pozisyon kontrolü ──────────────────────────────────
-    existing = get_open_position(symbol)
-    if existing:
-        amt           = float(existing["positionAmt"])
-        existing_side = "BUY" if amt > 0 else "SELL"
-
-        if existing_side == side:
-            log.info(f"{symbol} aynı yönde pozisyon zaten açık, sinyal atlandı.")
-            return {"status": "ignored", "reason": "same direction position already open"}
-
-        log.info(f"{symbol} karşı yön sinyali: {existing_side} kapatılıyor, {side} açılıyor.")
-        old_side, pnl = close_existing_position(symbol, existing)
-        if old_side is None:
-            return {"error": "Mevcut pozisyon kapatılamadı"}
-
-        notify_position_reversed(symbol, old_side, side, pnl)
-        time.sleep(1)
-
-    # ── Sembol bilgisi ──────────────────────────────────────────
-    price_precision, qty_precision, tick_size = get_symbol_info(symbol)
-    current_price = get_current_price(symbol)
-    if current_price == 0:
-        return {"error": "Fiyat alınamadı"}
-
-    # ── Margin & Kaldıraç ───────────────────────────────────────
-    set_margin_type(symbol)
-    set_leverage(symbol, FIXED_LEVERAGE)
-    valid_leverage = FIXED_LEVERAGE
-
-    # ── Miktar ──────────────────────────────────────────────────
-    quantity = calculate_quantity(symbol, valid_leverage, current_price, qty_precision)
-    if quantity <= 0:
-        return {"error": "Yetersiz bakiye"}
-
-    # ── Pozisyon aç ─────────────────────────────────────────────
-    order = place_order(symbol, side, quantity)
-    if not order:
-        return {"error": "Emir açılamadı"}
-
-    entry_price = get_entry_price(order, symbol)
-    log.info(f"Giriş fiyatı: {entry_price}")
-
-    # ── ATR bazlı TP/SL fiyatları ───────────────────────────────
+    strategy = select_strategy(atr_pct)
     tps = strategy["tps"]
-    sl_pct  = strategy["sl"]
-    tsl_cb  = strategy["tsl"]
+    msg = (
+        f"📈 <b>{raw} ATR Analizi</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"ATR%: <b>{atr_pct:.2f}</b> → <b>{strategy['label']}</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"SL: %{strategy['sl']}\n"
+        f"TP1: %{tps[0]} | TP2: %{tps[1]} | TP3: %{tps[2]} | TP4: %{tps[3]}\n"
+        f"TSL Callback: %{strategy['tsl']}"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
-    if side == "BUY":
-        tp_prices = [round_to_tick(entry_price * (1 + t / 100), tick_size) for t in tps]
-        sl_price  = round_to_tick(entry_price * (1 - sl_pct / 100), tick_size)
+
+async def cmd_pozisyonlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        positions = client.get_position_risk()
+        open_pos = [p for p in positions if float(p["positionAmt"]) != 0]
+        if not open_pos:
+            await update.message.reply_text("📭 Açık pozisyon yok.")
+            return
+        msg = "📊 <b>AÇIK POZİSYONLAR</b>\n━━━━━━━━━━━━━━━\n"
+        for p in open_pos:
+            amt = float(p["positionAmt"])
+            direction = "🟢 LONG" if amt > 0 else "🔴 SHORT"
+            pnl = float(p["unRealizedProfit"])
+            pnl_emoji = "📈" if pnl >= 0 else "📉"
+            msg += (
+                f"\n📌 <b>{p['symbol']}</b>\n"
+                f"  {direction} | {abs(amt)} adet\n"
+                f"  Giriş: {float(p['entryPrice']):.6f}\n"
+                f"  {pnl_emoji} PnL: {pnl:.2f} USDT\n"
+            )
+        await update.message.reply_text(msg, parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Hata: {e}")
+
+
+async def cmd_kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Kullanım: /kapat SOLUSDT\nveya /kapat all")
+        return
+    symbol_arg = context.args[0].upper()
+    if symbol_arg == "ALL":
+        try:
+            positions = client.get_position_risk()
+            open_pos = [p for p in positions if float(p["positionAmt"]) != 0]
+            if not open_pos:
+                await update.message.reply_text("📭 Kapatılacak pozisyon yok.")
+                return
+            for p in open_pos:
+                await _close_position(update, p["symbol"])
+        except Exception as e:
+            await update.message.reply_text(f"❌ Hata: {e}")
+        return
+    await _close_position(update, symbol_arg)
+
+
+async def _close_position(update, symbol):
+    try:
+        pos = get_open_position(symbol)
+        if not pos:
+            await update.message.reply_text(f"📭 {symbol} için açık pozisyon yok.")
+            return
+        amt  = float(pos["positionAmt"])
+        side = "SELL" if amt > 0 else "BUY"
+        qty  = abs(amt)
+        _, qty_precision, _ = get_symbol_info(symbol)
+        qty  = round(qty, qty_precision)
+        client.new_order(symbol=symbol, side=side, type="MARKET",
+                         quantity=qty, positionSide="BOTH", reduceOnly=True)
+        cancel_all_orders(symbol)
+        pnl = float(pos.get("unRealizedProfit", 0))
+        notify_position_closed(symbol, "BUY" if amt > 0 else "SELL", pnl)
+        log_trade_event("CLOSED_MANUAL", symbol, "BUY" if amt > 0 else "SELL", pnl=pnl)
+        await update.message.reply_text(
+            f"✅ <b>{symbol}</b> kapatıldı\n💵 PnL: {pnl:.2f} USDT",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ {symbol} kapatılamadı: {e}")
+
+
+async def cmd_istatistik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    full_text = update.message.text.strip()
+    parts = full_text.split(maxsplit=1)
+    date_str = parts[1].strip() if len(parts) > 1 else ""
+    if date_str:
+        try:
+            since_dt = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=timezone.utc)
+            period_label = f"{date_str} – şimdi arası"
+        except ValueError:
+            await update.message.reply_text("⚠️ Format: /istatistik 01.03.2026")
+            return
     else:
-        tp_prices = [round_to_tick(entry_price * (1 - t / 100), tick_size) for t in tps]
-        sl_price  = round_to_tick(entry_price * (1 + sl_pct / 100), tick_size)
-
-    log.info(f"TP seviyeleri: {tp_prices} | SL: {sl_price} | TSL callback: {tsl_cb}%")
-
-    # ── Emirleri yerleştir ──────────────────────────────────────
-    place_tp_orders(symbol, side, quantity, entry_price, tp_prices, price_precision, qty_precision, tick_size)
-    place_sl_order(symbol, side, quantity, sl_price, price_precision, tick_size)
-    place_trailing_stop(symbol, side, quantity, tp_prices[3], tsl_cb, price_precision, qty_precision, tick_size)
-
-    notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price, strategy, atr_pct)
-
-    log_trade_event("OPENED", symbol, side, extra={
-        "entry_price": entry_price,
-        "leverage":    valid_leverage,
-        "atr_pct":     atr_pct,
-        "strategy":    strategy["label"],
-        "tp_prices":   tp_prices,
-        "sl_price":    sl_price,
-    })
-
-    log.info(f"✅ {symbol} {side} tamamlandı | {valid_leverage}x | Giriş: {entry_price} | ATR%: {atr_pct:.2f}")
-    return {"status": "ok", "symbol": symbol, "side": side, "leverage": valid_leverage, "strategy": strategy["label"]}
+        since_dt = now - timedelta(hours=24)
+        period_label = "Son 24 saat"
+    await update.message.reply_text("⏳ İstatistikler hesaplanıyor...")
+    records = read_stats_log(since_dt)
+    if not records:
+        await update.message.reply_text(f"📭 <b>{period_label}</b> için kayıt bulunamadı.", parse_mode="HTML")
+        return
+    msg = build_stats_message(records, period_label)
+    await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
 
 
-# ════════════════════════════════════════════════════════════════
-# WEBHOOK — TP/SL/TSL CALLBACK ENDPOINT'İ
-# ════════════════════════════════════════════════════════════════
+user_states = {}
+
+
+async def cmd_sinyal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_states[update.effective_user.id] = {"step": "coin"}
+    await update.message.reply_text(
+        f"📌 <b>Manuel Sinyal</b>\n━━━━━━━━━━━━━━━\n"
+        f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP\n\n"
+        "Coin adını girin (örn: SOL, BTC, ETH):",
+        parse_mode="HTML"
+    )
+
+
+async def cmd_istatistik_tarih(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_states[update.effective_user.id] = {"step": "tarih"}
+    await update.message.reply_text(
+        "📅 <b>Tarihten İtibaren İstatistik</b>\n━━━━━━━━━━━━━━━\n"
+        "Başlangıç tarihini girin:\n<i>Örnek: 01.03.2026</i>",
+        parse_mode="HTML"
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in user_states:
+        return
+    state = user_states[uid]
+    text  = update.message.text.strip()
+
+    if state["step"] == "tarih":
+        try:
+            since_dt = datetime.strptime(text, "%d.%m.%Y").replace(tzinfo=timezone.utc)
+            period_label = f"{text} – şimdi arası"
+        except ValueError:
+            await update.message.reply_text("⚠️ Format hatalı. Örnek: 01.03.2026")
+            return
+        user_states.pop(uid, None)
+        await update.message.reply_text("⏳ İstatistikler hesaplanıyor...")
+        records = read_stats_log(since_dt)
+        if not records:
+            await update.message.reply_text(f"📭 <b>{period_label}</b> için kayıt bulunamadı.", parse_mode="HTML")
+            return
+        msg = build_stats_message(records, period_label)
+        await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
+        return
+
+    text = text.upper()
+    if state["step"] == "coin":
+        symbol = text.replace(".P", "").replace("USDT", "") + "USDT"
+        state["symbol"] = symbol
+        state["step"]   = "side"
+        keyboard = [[
+            InlineKeyboardButton("🟢 AL (LONG)",   callback_data="side_BUY"),
+            InlineKeyboardButton("🔴 SAT (SHORT)", callback_data="side_SELL"),
+        ]]
+        await update.message.reply_text(
+            f"📌 Coin: <b>{symbol}</b>\n\nYön seçin:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid  = update.effective_user.id
+    data = query.data
+
+    if data.startswith("side_"):
+        side  = data.split("_")[1]
+        state = user_states.get(uid, {})
+        if not state:
+            await query.edit_message_text("⚠️ Oturum süresi doldu. /sinyal ile tekrar başlayın.")
+            return
+        state["side"] = side
+        state["step"] = "confirm"
+        symbol        = state["symbol"]
+        current_price = get_current_price(symbol)
+        _, _, tick_size = get_symbol_info(symbol)
+        atr_pct  = get_atr_percent(symbol)
+        strategy = select_strategy(atr_pct)
+        state["strategy"] = strategy
+        state["atr_pct"]  = atr_pct
+        tps = strategy["tps"]
+        if side == "BUY":
+            tp_prices = [round_to_tick(current_price * (1 + t / 100), tick_size) for t in tps]
+            sl_price  = round_to_tick(current_price * (1 - strategy["sl"] / 100), tick_size)
+        else:
+            tp_prices = [round_to_tick(current_price * (1 - t / 100), tick_size) for t in tps]
+            sl_price  = round_to_tick(current_price * (1 + strategy["sl"] / 100), tick_size)
+        state["tp_prices"] = tp_prices
+        state["sl_price"]  = sl_price
+        side_text = "🟢 LONG (AL)" if side == "BUY" else "🔴 SHORT (SAT)"
+        msg = (
+            f"📋 <b>SİNYAL ÖNİZLEME</b>\n━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Coin:</b> {symbol}\n"
+            f"📊 <b>Yön:</b> {side_text}\n"
+            f"⚡ <b>Kaldıraç:</b> {FIXED_LEVERAGE}x\n"
+            f"💰 <b>Tahmini Giriş:</b> {current_price}\n"
+            f"📈 <b>ATR%:</b> {atr_pct:.2f} → {strategy['label']}\n━━━━━━━━━━━━━━━\n"
+            f"🎯 TP1 (%{tps[0]}): {tp_prices[0]}  →  %{TP_QTY_PCT} kapat\n"
+            f"🎯 TP2 (%{tps[1]}): {tp_prices[1]}  →  %{TP_QTY_PCT} kapat\n"
+            f"🎯 TP3 (%{tps[2]}): {tp_prices[2]}  →  %{TP_QTY_PCT} kapat\n"
+            f"🎯 TP4 (%{tps[3]}): {tp_prices[3]}  →  %{TP_QTY_PCT} kapat + TSL\n"
+            f"🔒 SL (%{strategy['sl']}): {sl_price}\n"
+            f"📉 TSL Callback: %{strategy['tsl']}\n━━━━━━━━━━━━━━━"
+        )
+        keyboard = [[
+            InlineKeyboardButton("✅ ONAYLA & GÖNDER", callback_data="confirm_yes"),
+            InlineKeyboardButton("❌ İPTAL",           callback_data="confirm_no"),
+        ]]
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data == "confirm_yes":
+        state = user_states.get(uid, {})
+        if not state:
+            await query.edit_message_text("⚠️ Oturum süresi doldu.")
+            return
+        await query.edit_message_text("⏳ Sinyal gönderiliyor...")
+        payload = {"secret": WEBHOOK_SECRET, "symbol": state["symbol"], "side": state["side"].lower()}
+        try:
+            result = process_signal(payload)
+            if result.get("status") == "ok":
+                await query.edit_message_text(
+                    f"✅ <b>Sinyal gönderildi!</b>\n"
+                    f"📌 {state['symbol']} | "
+                    f"{'🟢 LONG' if state['side'] == 'BUY' else '🔴 SHORT'} | {FIXED_LEVERAGE}x",
+                    parse_mode="HTML"
+                )
+            else:
+                await query.edit_message_text(f"❌ Hata: {result.get('error', 'Bilinmeyen hata')}")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Hata: {e}")
+        user_states.pop(uid, None)
+
+    elif data == "confirm_no":
+        user_states.pop(uid, None)
+        await query.edit_message_text("❌ Sinyal iptal edildi.")
+
 
 @app.route("/algo_callback", methods=["POST"])
 def algo_callback():
@@ -821,7 +984,7 @@ if __name__ == "__main__":
         send_telegram(
             f"🚀 <b>Claude Trading Bot başlatıldı!</b>\n"
             f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP\n"
-            f"📈 ATR &lt;{ATR_MID_PCT}% → DAR | {ATR_MID_PCT}-{ATR_HIGH_PCT}% → ORTA | &gt;{ATR_HIGH_PCT}% → GENİŞ\n"
+            f"📈 ATR %{ATR_MID_PCT} altı → DAR | %{ATR_MID_PCT}-{ATR_HIGH_PCT} → ORTA | %{ATR_HIGH_PCT} üstü → GENİŞ\n"
             f"/yardim ile komutları görebilirsiniz."
         )
     else:
