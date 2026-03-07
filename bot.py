@@ -1271,7 +1271,7 @@ def run_telegram():
 # USER DATA STREAM — TP/SL/TSL TETİKLENME DİNLEYİCİSİ
 # ════════════════════════════════════════════════════════════════
 
-WS_BASE = "wss://fstream.binance.com/ws/"
+WS_BASE = "wss://dstream.binancefuture.com/ws/"
 # Demo hesap kullanıyorsan yukarıdaki satırı şununla değiştir:
 # WS_BASE = "wss://stream.binancefuture.com/ws/"
 
