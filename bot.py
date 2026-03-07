@@ -22,6 +22,8 @@ import time
 import threading
 import requests as req
 import websocket
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
 from binance.error import ClientError
@@ -71,8 +73,36 @@ app = Flask(__name__)
 # ─── TELEGRAM UYGULAMA (global) ─────────────────────────────────
 telegram_app = None
 
-# ─── İSTATİSTİK LOG DOSYASI ─────────────────────────────────────
-STATS_LOG_FILE = "trade_stats.jsonl"
+# ─── PostgreSQL BAĞLANTISI ──────────────────────────────────────
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_db():
+    """Tablo yoksa oluştur."""
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trade_events (
+                id         SERIAL PRIMARY KEY,
+                ts         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                event      TEXT NOT NULL,
+                symbol     TEXT NOT NULL,
+                side       TEXT NOT NULL,
+                pnl        FLOAT,
+                extra      JSONB
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        log.info("✅ DB tablosu hazır.")
+    except Exception as e:
+        log.error(f"DB init hatası: {e}")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -80,59 +110,42 @@ STATS_LOG_FILE = "trade_stats.jsonl"
 # ════════════════════════════════════════════════════════════════
 
 def log_trade_event(event_type: str, symbol: str, side: str, pnl: float = None, extra: dict = None):
-    """
-    Her önemli olayı JSONL dosyasına kaydeder.
-    event_type örnekleri:
-      "OPENED"        → pozisyon açıldı
-      "SL_HIT"        → stop loss tetiklendi
-      "TP1_HIT"       → TP1 tetiklendi (ve sonra SL → TP1+SL)
-      "TP2_HIT"       → TP2 tetiklendi
-      "TP3_HIT"       → TP3 tetiklendi
-      "TP4_HIT"       → TP4 tetiklendi
-      "TSL_ACTIVE"    → TSL devreye girdi
-      "TSL_HIT"       → TSL kapattı
-      "CLOSED_MANUAL" → elle kapatıldı
-      "REVERSED"      → karşı sinyal geldi, pozisyon tersine çevrildi
-    """
-    record = {
-        "ts":    datetime.now(timezone.utc).isoformat(),
-        "event": event_type,
-        "symbol": symbol,
-        "side":   side,
-        "pnl":    pnl,
-    }
-    if extra:
-        record.update(extra)
     try:
-        with open(STATS_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO trade_events (event, symbol, side, pnl, extra) VALUES (%s, %s, %s, %s, %s)",
+            (event_type, symbol, side, pnl, json.dumps(extra) if extra else None)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
     except Exception as e:
-        log.error(f"İstatistik log yazılamadı: {e}")
+        log.error(f"DB yazma hatası: {e}")
 
 
 def read_stats_log(since_dt: datetime) -> list:
     """since_dt'den itibaren tüm kayıtları döner."""
-    records = []
-    if not os.path.exists(STATS_LOG_FILE):
-        return records
     try:
-        with open(STATS_LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    rec_dt = datetime.fromisoformat(rec["ts"])
-                    if rec_dt.tzinfo is None:
-                        rec_dt = rec_dt.replace(tzinfo=timezone.utc)
-                    if rec_dt >= since_dt:
-                        records.append(rec)
-                except Exception:
-                    continue
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT * FROM trade_events WHERE ts >= %s ORDER BY ts ASC",
+            (since_dt,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        # dict listesine çevir, ts'yi string yap
+        records = []
+        for row in rows:
+            r = dict(row)
+            r["ts"] = r["ts"].isoformat()
+            records.append(r)
+        return records
     except Exception as e:
-        log.error(f"İstatistik log okunamadı: {e}")
-    return records
+        log.error(f"DB okuma hatası: {e}")
+        return []
 
 
 def build_stats_message(records: list, period_label: str) -> str:
@@ -1291,6 +1304,8 @@ def run_user_stream():
 if __name__ == "__main__":
     log.info("🤖 Claude Trading Bot başlatıldı...")
     log.info(f"⚡ Strateji: {FIXED_LEVERAGE}x | SL %{SL_PCT} | TP aralığı %{TP_STEP_PCT} | TSL %{TSL_CALLBACK_PCT}")
+
+    init_db()  # PostgreSQL tablosunu oluştur
 
     if TELEGRAM_TOKEN:
         t = threading.Thread(target=run_telegram, daemon=True)
