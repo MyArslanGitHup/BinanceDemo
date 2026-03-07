@@ -6,11 +6,11 @@ TradingView webhook → Binance Futures işlem açma botu
 SABİT STRATEJİ:
   Kaldıraç : 5x
   ATR bazlı dinamik TP/SL (ATR, sinyalin geldiği TradingView timeframe'inde hesaplanır):
-    ATR <1.5%  → DAR  : SL %1.0, TP [0.5,1,1.5,2]%,  TSL %1.0
-    ATR 1.5-3% → ORTA : SL %2.0, TP [1,2,3,4]%,      TSL %2.0
-    ATR >3.0%  → GENİŞ: SL %4.0, TP [2,4,6,8]%,      TSL %4.0
-  TP miktarları: TP1=%30, TP2=%20, TP3=%20, TP4=%20 (toplam %90)
-  Kalan %10 → TSL ile korunur
+    ATR <1.5%  → DAR  : SL %1.0, TP [1,2,3,4]%,   TSL %1.0
+    ATR 1.5-3% → ORTA : SL %2.0, TP [2,4,6,8]%,   TSL %1.5
+    ATR >3.0%  → GENİŞ: SL %3.5, TP [3,6,9,12]%,  TSL %3.0
+  Her TP seviyesinde %20 kapat (4 TP = %80)
+  Kalan %20 → TSL ile korunur
 
 TradingView alert mesajı örneği:
   {
@@ -67,13 +67,13 @@ BASE_URL      = "https://demo-fapi.binance.com"
 
 # ─── SABİT STRATEJİ ─────────────────────────────────────────────
 FIXED_LEVERAGE = 5          # ← 10x'ten 5x'e düşürüldü
-TP_QTY_PCTS    = [30, 20, 20, 20]   # Her TP seviyesinde kapatılacak % (toplam %90, kalan %10 TSL)
+TP_QTY_PCT     = 20
 
 # ─── ATR BAZLI DİNAMİK STRATEJİ ────────────────────────────────
 ATR_REGIMES = {
-    "dar":   {"sl": 1.0, "tps": [0.5, 1.0, 1.5, 2.0], "tsl": 1.0},
-    "orta":  {"sl": 2.0, "tps": [1.0, 2.0, 3.0, 4.0], "tsl": 2.0},
-    "genis": {"sl": 4.0, "tps": [2.0, 4.0, 6.0, 8.0], "tsl": 4.0},
+    "dar":   {"sl": 1.0, "tps": [1, 2, 3, 4],    "tsl": 1.0},
+    "orta":  {"sl": 2.0, "tps": [2, 4, 6, 8],    "tsl": 1.5},
+    "genis": {"sl": 3.5, "tps": [3, 6, 9, 12],   "tsl": 3.0},
 }
 ATR_PERIOD          = 13    # ATR hesaplama periyodu — TradingView göstergesiyle eşleşir (SMA 13)
 ATR_FALLBACK_TF     = "1h"  # TradingView timeframe gelmezse kullanılacak varsayılan
@@ -244,7 +244,7 @@ def get_strategy_params(symbol: str, tv_interval: str = "") -> dict:
 
     log.info(
         f"{symbol} Rejim={regime.upper()} | "
-        f"ATR%={f'{atr_pct:.3f}%' if atr_pct is not None else 'N/A'} [{binance_interval}] | "
+        f"ATR%={atr_pct:.3f}% [{binance_interval}] | "
         f"SL={params['sl']}% | "
         f"TPs={params['tps']} | "
         f"TSL={params['tsl']}%"
@@ -487,10 +487,10 @@ def notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price, regime, 
 
     tp_lines = ""
     for i, tp in enumerate(tp_prices, start=1):
-        tp_qty_pct = TP_QTY_PCTS[i - 1]
-        tp_lines += f"🎯 <b>TP{i}:</b> {tp}  →  %{tp_qty_pct} kapat\n"
+        tp_lines += f"🎯 <b>TP{i}:</b> {tp}  →  %{TP_QTY_PCT} kapat\n"
     if len(tp_prices) == 4:
         tp_lines = tp_lines.rstrip("\n")
+        # Son satırı TSL notu ile güncelle
         tp_parts = tp_lines.split("\n")
         tp_parts[-1] = tp_parts[-1].rstrip() + " + TSL"
         tp_lines = "\n".join(tp_parts) + "\n"
@@ -564,9 +564,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Claude Trading Bot</b>\n"
         "━━━━━━━━━━━━━━━\n"
         f"⚡ {FIXED_LEVERAGE}x | ATR bazlı dinamik TP/SL\n"
-        f"🔵 DAR  (ATR&lt;1.5%): SL %1.0 | TP [0.5,1,1.5,2]% | TSL %1.0\n"
-        f"🟡 ORTA (ATR 1.5-3%): SL %2.0 | TP [1,2,3,4]%    | TSL %2.0\n"
-        f"🔴 GENİŞ(ATR&gt;3.0%): SL %4.0 | TP [2,4,6,8]%    | TSL %4.0\n"
+        f"🔵 DAR  (ATR&lt;1.5%): SL %1.0 | TP [1,2,3,4]%  | TSL %1.0\n"
+        f"🟡 ORTA (ATR 1.5-3%): SL %2.0 | TP [2,4,6,8]%  | TSL %1.5\n"
+        f"🔴 GENİŞ(ATR&gt;3.0%): SL %3.5 | TP [3,6,9,12]% | TSL %3.0\n"
         "━━━━━━━━━━━━━━━\n"
         "📋 <b>Komutlar:</b>\n\n"
         "/sinyal — Manuel sinyal gönder\n"
@@ -884,9 +884,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tp_lines = ""
         for i, (tp, pct) in enumerate(zip(tp_prices, tp_pcts), start=1):
-            tp_qty_pct = TP_QTY_PCTS[i - 1]
             extra = " + TSL" if i == len(tp_prices) else ""
-            tp_lines += f"🎯 TP{i} (%{pct}): {tp}  →  %{tp_qty_pct} kapat{extra}\n"
+            tp_lines += f"🎯 TP{i} (%{pct}): {tp}  →  %{TP_QTY_PCT} kapat{extra}\n"
 
         msg = (
             f"📋 <b>SİNYAL ÖNİZLEME</b>\n"
@@ -1204,11 +1203,10 @@ def cancel_all_orders(symbol):
 def place_tp_orders(symbol, side, quantity, entry_price, tp_prices, tp_pcts,
                     price_precision, qty_precision, tick_size):
     close_side = "SELL" if side == "BUY" else "BUY"
+    tp_qty     = round(quantity * (TP_QTY_PCT / 100), qty_precision)
     algo_ids   = []
 
     for i, (tp_price, pct) in enumerate(zip(tp_prices, tp_pcts), start=1):
-        tp_qty_pct = TP_QTY_PCTS[i - 1]
-        tp_qty     = round(quantity * (tp_qty_pct / 100), qty_precision)
         tp_price_rounded = round_to_tick(tp_price, tick_size)
         if tp_price_rounded <= 0:
             log.error(f"TP{i} fiyatı geçersiz ({tp_price_rounded}), atlanıyor")
@@ -1223,7 +1221,7 @@ def place_tp_orders(symbol, side, quantity, entry_price, tp_prices, tp_pcts,
             "reduceOnly":   "true",
             "timeInForce":  "GTE_GTC",
         }
-        algo_id = place_algo_order(params, label=f"TP{i} ({tp_price_rounded} / %{pct} | miktar %{tp_qty_pct})")
+        algo_id = place_algo_order(params, label=f"TP{i} ({tp_price_rounded} / %{pct})")
         if algo_id:
             algo_ids.append(algo_id)
 
@@ -1252,7 +1250,7 @@ def place_sl_order(symbol, side, quantity, entry_price, sl_pct, price_precision,
 def place_trailing_stop(symbol, side, quantity, tp4_price, tsl_callback_pct,
                         price_precision, qty_precision, tick_size):
     close_side    = "SELL" if side == "BUY" else "BUY"
-    remaining_pct = 100 - sum(TP_QTY_PCTS)  # 100 - 90 = %10
+    remaining_pct = 100 - (TP_QTY_PCT * 4)
     tsl_qty       = round(quantity * (remaining_pct / 100), qty_precision)
     if tsl_qty <= 0:
         log.warning("TSL: miktar 0, atlanıyor")
@@ -1642,9 +1640,9 @@ def run_user_stream():
 if __name__ == "__main__":
     log.info("🤖 Claude Trading Bot başlatıldı...")
     log.info(f"⚡ Strateji: {FIXED_LEVERAGE}x | ATR bazlı dinamik TP/SL")
-    log.info(f"  DAR  (ATR<1.5%): SL %1.0 | TP [0.5,1,1.5,2]% | TSL %1.0")
-    log.info(f"  ORTA (ATR 1.5-3%): SL %2.0 | TP [1,2,3,4]%    | TSL %2.0")
-    log.info(f"  GENİŞ(ATR>3.0%): SL %4.0 | TP [2,4,6,8]%    | TSL %4.0")
+    log.info(f"  DAR  (ATR<1.5%): SL %1.0 | TP [1,2,3,4]%   | TSL %1.0")
+    log.info(f"  ORTA (ATR 1.5-3%): SL %2.0 | TP [2,4,6,8]%   | TSL %1.5")
+    log.info(f"  GENİŞ(ATR>3.0%): SL %3.5 | TP [3,6,9,12]%  | TSL %3.0")
 
     init_db()
 
