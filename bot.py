@@ -3,19 +3,14 @@ Claude Trading Bot — Binance Futures
 TradingView webhook → Binance Futures işlem açma botu
 + Telegram Bot entegrasyonu
 
-ATR BAZLI DİNAMİK STRATEJİ:
-  Kaldıraç : 5x (sabit)
-
-  ATR% < 1.5  → DAR AYARLAR
-    SL: %1.0  | TP1:%1.0 TP2:%2.0 TP3:%3.0 TP4:%4.0 | TSL:%1.0
-
-  ATR% 1.5-3.0 → ORTA AYARLAR
-    SL: %2.0  | TP1:%2.0 TP2:%4.0 TP3:%6.0 TP4:%8.0 | TSL:%1.5
-
-  ATR% > 3.0   → GENİŞ AYARLAR
-    İşlem açılmaz.
-
-  Her TP → %20 kapat, kalan %20 → TSL ile korunur
+SABİT STRATEJİ:
+  Kaldıraç : 5x
+  ATR bazlı dinamik TP/SL:
+    ATR <1.5%  → DAR  : SL %1.0, TP [1,2,3,4]%,   TSL %1.0
+    ATR 1.5-3% → ORTA : SL %2.0, TP [2,4,6,8]%,   TSL %1.5
+    ATR >3.0%  → GENİŞ: SL %3.5, TP [3,6,9,12]%,  TSL %3.0
+  Her TP seviyesinde %20 kapat (4 TP = %80)
+  Kalan %20 → TSL ile korunur
 """
 
 import os
@@ -62,20 +57,18 @@ TRADE_USDT_FIXED = 100  # Sabit işlem miktarı (USDT)
 MARGIN_TYPE   = "ISOLATED"
 BASE_URL      = "https://demo-fapi.binance.com"
 
-# ─── SABİT PARAMETRELER ─────────────────────────────────────────
-FIXED_LEVERAGE   = 5      # 10x yerine 5x
-TP_QTY_PCT       = 20     # Her TP'de %20 kapat
+# ─── SABİT STRATEJİ ─────────────────────────────────────────────
+FIXED_LEVERAGE = 5          # ← 10x'ten 5x'e düşürüldü
+TP_QTY_PCT     = 20
 
-# ─── ATR BAZLI STRATEJİ TANIMLARI ───────────────────────────────
-# Her senaryo: (sl_pct, [tp1, tp2, tp3, tp4], tsl_callback)
-ATR_STRATEGIES = {
-    "dar":   {"sl": 1.0, "tps": [1.0, 2.0, 3.0, 4.0],  "tsl": 1.0, "label": "DAR   (ATR<%1.5)"},
-    "orta":  {"sl": 2.0, "tps": [2.0, 4.0, 6.0, 8.0],  "tsl": 1.5, "label": "ORTA  (ATR%1.5-3.0)"},
-    "genis": {"sl": 3.5, "tps": [3.0, 6.0, 9.0, 12.0], "tsl": 3.0, "label": "GENİŞ (ATR%>3.0)"},
+# ─── ATR BAZLI DİNAMİK STRATEJİ ────────────────────────────────
+ATR_REGIMES = {
+    "dar":   {"sl": 1.0, "tps": [1, 2, 3, 4],    "tsl": 1.0},
+    "orta":  {"sl": 2.0, "tps": [2, 4, 6, 8],    "tsl": 1.5},
+    "genis": {"sl": 3.5, "tps": [3, 6, 9, 12],   "tsl": 3.0},
 }
-ATR_MID_PCT  = 1.5   # Dar / Orta sınırı
-ATR_HIGH_PCT = 3.0   # Orta / Geniş sınırı
-ATR_PERIOD   = 14    # ATR periyodu (kline sayısı)
+ATR_PERIOD = 14   # ATR hesaplama periyodu (mum sayısı)
+ATR_KLINE_INTERVAL = "1h"  # ATR için kullanılan mum aralığı
 
 # ─── BİNANCE CLIENT ─────────────────────────────────────────────
 client = UMFutures(key=API_KEY, secret=API_SECRET, base_url=BASE_URL)
@@ -119,50 +112,82 @@ def init_db():
 
 
 # ════════════════════════════════════════════════════════════════
-# ATR BAZLI STRATEJİ SEÇİCİ
+# ATR HESAPLAMA
 # ════════════════════════════════════════════════════════════════
 
-def get_atr_percent(symbol: str, interval: str = "4h") -> float:
+def get_atr_pct(symbol: str, period: int = ATR_PERIOD, interval: str = ATR_KLINE_INTERVAL) -> float:
     """
-    Binance'den son ATR_PERIOD mumun TR ortalamasını alır,
-    fiyata bölerek ATR% döner.
-    Hata durumunda -1 döner.
+    Son `period` mumu kullanarak ATR hesaplar ve güncel fiyata
+    oranını yüzde olarak döner.
+    Hata durumunda None döner.
     """
     try:
-        klines = client.klines(symbol=symbol, interval=interval, limit=ATR_PERIOD + 1)
-        if len(klines) < 2:
-            log.error(f"ATR için yeterli kline yok: {symbol}")
-            return -1.0
+        limit  = period + 1
+        klines = client.klines(symbol=symbol, interval=interval, limit=limit)
+        if len(klines) < period + 1:
+            log.warning(f"{symbol} ATR için yeterli mum yok ({len(klines)})")
+            return None
 
-        tr_values = []
+        highs  = [float(k[2]) for k in klines]
+        lows   = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+
+        # True Range listesi
+        true_ranges = []
         for i in range(1, len(klines)):
-            high      = float(klines[i][2])
-            low       = float(klines[i][3])
-            prev_close = float(klines[i - 1][4])
-            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-            tr_values.append(tr)
+            h  = highs[i]
+            l  = lows[i]
+            pc = closes[i - 1]
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            true_ranges.append(tr)
 
-        atr       = sum(tr_values) / len(tr_values)
-        cur_price = float(klines[-1][4])
+        atr       = sum(true_ranges[-period:]) / period
+        cur_price = closes[-1]
         atr_pct   = (atr / cur_price) * 100
-        log.info(f"{symbol} ATR%={atr_pct:.2f} (interval={interval})")
-        return round(atr_pct, 2)
+
+        log.info(f"{symbol} ATR={atr:.6f}, Fiyat={cur_price:.6f}, ATR%={atr_pct:.3f}%")
+        return atr_pct
 
     except Exception as e:
-        log.error(f"ATR hesaplanamadı ({symbol}): {e}")
-        return -1.0
+        log.error(f"{symbol} ATR hesaplama hatası: {e}")
+        return None
 
 
-def select_strategy(atr_pct: float) -> dict:
-    """ATR%'ye göre strateji seç. Her zaman bir strateji döner."""
-    if atr_pct < 0:
-        log.warning("ATR alınamadı, varsayılan ORTA strateji kullanılıyor.")
-        return ATR_STRATEGIES["orta"]
-    if atr_pct < ATR_MID_PCT:
-        return ATR_STRATEGIES["dar"]
-    if atr_pct < ATR_HIGH_PCT:
-        return ATR_STRATEGIES["orta"]
-    return ATR_STRATEGIES["genis"]
+def get_regime(atr_pct: float) -> str:
+    """ATR yüzdesine göre rejim döner: 'dar' | 'orta' | 'genis'"""
+    if atr_pct < 1.5:
+        return "dar"
+    elif atr_pct <= 3.0:
+        return "orta"
+    else:
+        return "genis"
+
+
+def get_strategy_params(symbol: str) -> dict:
+    """
+    Sembol için ATR hesaplar, rejimi belirler ve strateji
+    parametrelerini döner.
+    ATR hesaplanamadığında güvenli varsayılan olarak 'orta' kullanılır.
+    """
+    atr_pct = get_atr_pct(symbol)
+    if atr_pct is None:
+        regime = "orta"
+        log.warning(f"{symbol} ATR alınamadı, varsayılan rejim: {regime}")
+    else:
+        regime = get_regime(atr_pct)
+
+    params = ATR_REGIMES[regime].copy()
+    params["regime"]  = regime
+    params["atr_pct"] = atr_pct
+
+    log.info(
+        f"{symbol} Rejim={regime.upper()} | "
+        f"ATR%={atr_pct:.3f}% | "
+        f"SL={params['sl']}% | "
+        f"TPs={params['tps']} | "
+        f"TSL={params['tsl']}%"
+    )
+    return params
 
 
 # ════════════════════════════════════════════════════════════════
@@ -392,10 +417,22 @@ def send_telegram(message: str, parse_mode="HTML"):
         log.error(f"Telegram mesajı gönderilemedi: {e}")
 
 
-def notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price, strategy: dict, atr_pct: float):
+def notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price, regime, atr_pct, tsl_callback):
     emoji = "🟢" if side == "BUY" else "🔴"
     direction = "LONG (AL)" if side == "BUY" else "SHORT (SAT)"
-    tps = strategy["tps"]
+    regime_emoji = {"dar": "🔵", "orta": "🟡", "genis": "🔴"}.get(regime, "⚪")
+    atr_str = f"{atr_pct:.2f}%" if atr_pct is not None else "N/A"
+
+    tp_lines = ""
+    for i, tp in enumerate(tp_prices, start=1):
+        tp_lines += f"🎯 <b>TP{i}:</b> {tp}  →  %{TP_QTY_PCT} kapat\n"
+    if len(tp_prices) == 4:
+        tp_lines = tp_lines.rstrip("\n")
+        # Son satırı TSL notu ile güncelle
+        tp_parts = tp_lines.split("\n")
+        tp_parts[-1] = tp_parts[-1].rstrip() + " + TSL"
+        tp_lines = "\n".join(tp_parts) + "\n"
+
     msg = (
         f"{emoji} <b>YENİ POZİSYON</b>\n"
         f"━━━━━━━━━━━━━━━\n"
@@ -403,14 +440,12 @@ def notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price, strategy
         f"📊 <b>Yön:</b> {direction}\n"
         f"⚡ <b>Kaldıraç:</b> {FIXED_LEVERAGE}x\n"
         f"💰 <b>Giriş:</b> {entry_price}\n"
-        f"📈 <b>ATR%:</b> {atr_pct:.2f} → <b>{strategy['label']}</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>TP1 (%{tps[0]}):</b> {tp_prices[0]}  →  %{TP_QTY_PCT} kapat\n"
-        f"🎯 <b>TP2 (%{tps[1]}):</b> {tp_prices[1]}  →  %{TP_QTY_PCT} kapat\n"
-        f"🎯 <b>TP3 (%{tps[2]}):</b> {tp_prices[2]}  →  %{TP_QTY_PCT} kapat\n"
-        f"🎯 <b>TP4 (%{tps[3]}):</b> {tp_prices[3]}  →  %{TP_QTY_PCT} kapat + TSL\n"
-        f"🔒 <b>SL (%{strategy['sl']}):</b>  {sl_price}\n"
-        f"📉 <b>TSL Callback:</b> %{strategy['tsl']}\n"
+        f"{regime_emoji} <b>ATR Rejimi:</b> {regime.upper()} (ATR={atr_str})\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{tp_lines}"
+        f"🔒 <b>SL:</b> {sl_price}\n"
+        f"📉 <b>TSL Callback:</b> %{tsl_callback}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🕐 {time.strftime('%H:%M:%S')}"
     )
@@ -466,15 +501,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🤖 <b>Claude Trading Bot</b>\n"
         "━━━━━━━━━━━━━━━\n"
-        f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP | TSL Dinamik\n"
-        f"📈 ATR %{ATR_MID_PCT} altı → DAR | %{ATR_MID_PCT}-{ATR_HIGH_PCT} → ORTA | %{ATR_HIGH_PCT} üstü → GENİŞ\n"
+        f"⚡ {FIXED_LEVERAGE}x | ATR bazlı dinamik TP/SL\n"
+        f"🔵 DAR  (ATR&lt;1.5%): SL %1.0 | TP [1,2,3,4]%  | TSL %1.0\n"
+        f"🟡 ORTA (ATR 1.5-3%): SL %2.0 | TP [2,4,6,8]%  | TSL %1.5\n"
+        f"🔴 GENİŞ(ATR&gt;3.0%): SL %3.5 | TP [3,6,9,12]% | TSL %3.0\n"
         "━━━━━━━━━━━━━━━\n"
         "📋 <b>Komutlar:</b>\n\n"
         "/sinyal — Manuel sinyal gönder\n"
         "/pozisyonlar — Açık pozisyonları göster\n"
         "/kapat [COIN] — Pozisyon kapat\n"
         "/bakiye — USDT bakiyesi\n"
-        "/atr [COIN] — Coin ATR% göster\n"
         "/istatistik — Son 24 saatin özeti\n"
         "/istatistik_tarih — Tarih seçerek özet\n"
         "/istatistik 01.03.2026 — Tarihten itibaren özet\n"
@@ -491,40 +527,15 @@ async def cmd_bakiye(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_atr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/atr BTCUSDT — Coin'in ATR% ve strateji tipini gösterir."""
-    if not context.args:
-        await update.message.reply_text("⚠️ Kullanım: /atr BTCUSDT\nveya /atr BTC")
-        return
-
-    raw = context.args[0].upper().replace(".P", "").replace("USDT", "") + "USDT"
-    atr_pct  = get_atr_percent(raw)
-
-    if atr_pct < 0:
-        await update.message.reply_text(f"❌ {raw} için ATR alınamadı.")
-        return
-
-    strategy = select_strategy(atr_pct)
-    tps = strategy["tps"]
-    msg = (
-        f"📈 <b>{raw} ATR Analizi</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"ATR%: <b>{atr_pct:.2f}</b> → <b>{strategy['label']}</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"SL: %{strategy['sl']}\n"
-        f"TP1: %{tps[0]} | TP2: %{tps[1]} | TP3: %{tps[2]} | TP4: %{tps[3]}\n"
-        f"TSL Callback: %{strategy['tsl']}"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
 async def cmd_pozisyonlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         positions = client.get_position_risk()
         open_pos = [p for p in positions if float(p["positionAmt"]) != 0]
+
         if not open_pos:
             await update.message.reply_text("📭 Açık pozisyon yok.")
             return
+
         msg = "📊 <b>AÇIK POZİSYONLAR</b>\n━━━━━━━━━━━━━━━\n"
         for p in open_pos:
             amt = float(p["positionAmt"])
@@ -537,6 +548,7 @@ async def cmd_pozisyonlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"  Giriş: {float(p['entryPrice']):.6f}\n"
                 f"  {pnl_emoji} PnL: {pnl:.2f} USDT\n"
             )
+
         await update.message.reply_text(msg, parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"❌ Hata: {e}")
@@ -544,9 +556,13 @@ async def cmd_pozisyonlar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ Kullanım: /kapat SOLUSDT\nveya /kapat all")
+        await update.message.reply_text(
+            "⚠️ Kullanım: /kapat SOLUSDT\nveya /kapat all (hepsini kapat)"
+        )
         return
+
     symbol_arg = context.args[0].upper()
+
     if symbol_arg == "ALL":
         try:
             positions = client.get_position_risk()
@@ -559,6 +575,7 @@ async def cmd_kapat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Hata: {e}")
         return
+
     await _close_position(update, symbol_arg)
 
 
@@ -568,58 +585,81 @@ async def _close_position(update, symbol):
         if not pos:
             await update.message.reply_text(f"📭 {symbol} için açık pozisyon yok.")
             return
-        amt  = float(pos["positionAmt"])
-        side = "SELL" if amt > 0 else "BUY"
-        qty  = abs(amt)
+
+        amt   = float(pos["positionAmt"])
+        side  = "SELL" if amt > 0 else "BUY"
+        qty   = abs(amt)
         _, qty_precision, _ = get_symbol_info(symbol)
-        qty  = round(qty, qty_precision)
-        client.new_order(symbol=symbol, side=side, type="MARKET",
-                         quantity=qty, positionSide="BOTH", reduceOnly=True)
+        qty   = round(qty, qty_precision)
+
+        client.new_order(
+            symbol=symbol, side=side, type="MARKET",
+            quantity=qty, positionSide="BOTH", reduceOnly=True
+        )
+        log.info(f"{symbol} pozisyon kapatıldı")
+
         cancel_all_orders(symbol)
+
         pnl = float(pos.get("unRealizedProfit", 0))
         notify_position_closed(symbol, "BUY" if amt > 0 else "SELL", pnl)
+
         log_trade_event("CLOSED_MANUAL", symbol, "BUY" if amt > 0 else "SELL", pnl=pnl)
+
         await update.message.reply_text(
-            f"✅ <b>{symbol}</b> kapatıldı\n💵 PnL: {pnl:.2f} USDT",
+            f"✅ <b>{symbol}</b> kapatıldı (tüm emirler iptal edildi)\n💵 PnL: {pnl:.2f} USDT",
             parse_mode="HTML"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ {symbol} kapatılamadı: {e}")
 
 
+# ─── İSTATİSTİK KOMUTU ──────────────────────────────────────────
+
 async def cmd_istatistik(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from datetime import timedelta
     now = datetime.now(timezone.utc)
+
     full_text = update.message.text.strip()
     parts = full_text.split(maxsplit=1)
     date_str = parts[1].strip() if len(parts) > 1 else ""
+
     if date_str:
         try:
             since_dt = datetime.strptime(date_str, "%d.%m.%Y").replace(tzinfo=timezone.utc)
             period_label = f"{date_str} – şimdi arası"
         except ValueError:
-            await update.message.reply_text("⚠️ Format: /istatistik 01.03.2026")
+            await update.message.reply_text(
+                "⚠️ Tarih formatı hatalı.\n"
+                "Doğru format: /istatistik 01.03.2026"
+            )
             return
     else:
+        from datetime import timedelta
         since_dt = now - timedelta(hours=24)
         period_label = "Son 24 saat"
+
     await update.message.reply_text("⏳ İstatistikler hesaplanıyor...")
+
     records = read_stats_log(since_dt)
+
     if not records:
-        await update.message.reply_text(f"📭 <b>{period_label}</b> için kayıt bulunamadı.", parse_mode="HTML")
+        await update.message.reply_text(
+            f"📭 <b>{period_label}</b> için kayıt bulunamadı.",
+            parse_mode="HTML"
+        )
         return
+
     msg = build_stats_message(records, period_label)
     await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
 
 
+# ─── MANUEL SİNYAL ──────────────────────────────────────────────
 user_states = {}
-
 
 async def cmd_sinyal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states[update.effective_user.id] = {"step": "coin"}
     await update.message.reply_text(
-        f"📌 <b>Manuel Sinyal</b>\n━━━━━━━━━━━━━━━\n"
-        f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP\n\n"
+        "📌 <b>Manuel Sinyal</b>\n━━━━━━━━━━━━━━━\n"
+        f"⚡ {FIXED_LEVERAGE}x | ATR bazlı dinamik TP/SL\n\n"
         "Coin adını girin (örn: SOL, BTC, ETH):",
         parse_mode="HTML"
     )
@@ -628,8 +668,10 @@ async def cmd_sinyal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_istatistik_tarih(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_states[update.effective_user.id] = {"step": "tarih"}
     await update.message.reply_text(
-        "📅 <b>Tarihten İtibaren İstatistik</b>\n━━━━━━━━━━━━━━━\n"
-        "Başlangıç tarihini girin:\n<i>Örnek: 01.03.2026</i>",
+        "📅 <b>Tarihten İtibaren İstatistik</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        "Başlangıç tarihini girin:\n"
+        "<i>Örnek: 01.03.2026</i>",
         parse_mode="HTML"
     )
 
@@ -638,6 +680,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in user_states:
         return
+
     state = user_states[uid]
     text  = update.message.text.strip()
 
@@ -646,13 +689,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             since_dt = datetime.strptime(text, "%d.%m.%Y").replace(tzinfo=timezone.utc)
             period_label = f"{text} – şimdi arası"
         except ValueError:
-            await update.message.reply_text("⚠️ Format hatalı. Örnek: 01.03.2026")
+            await update.message.reply_text(
+                "⚠️ Format hatalı. Tekrar deneyin:\n<i>Örnek: 01.03.2026</i>",
+                parse_mode="HTML"
+            )
             return
+
         user_states.pop(uid, None)
         await update.message.reply_text("⏳ İstatistikler hesaplanıyor...")
         records = read_stats_log(since_dt)
         if not records:
-            await update.message.reply_text(f"📭 <b>{period_label}</b> için kayıt bulunamadı.", parse_mode="HTML")
+            await update.message.reply_text(
+                f"📭 <b>{period_label}</b> için kayıt bulunamadı.",
+                parse_mode="HTML"
+            )
             return
         msg = build_stats_message(records, period_label)
         await update.message.reply_text(f"<pre>{msg}</pre>", parse_mode="HTML")
@@ -686,65 +736,93 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not state:
             await query.edit_message_text("⚠️ Oturum süresi doldu. /sinyal ile tekrar başlayın.")
             return
+
         state["side"] = side
         state["step"] = "confirm"
-        symbol        = state["symbol"]
-        current_price = get_current_price(symbol)
-        _, _, tick_size = get_symbol_info(symbol)
-        atr_pct  = get_atr_percent(symbol)
-        strategy = select_strategy(atr_pct)
+
+        current_price = get_current_price(state["symbol"])
+        _, _, tick_size = get_symbol_info(state["symbol"])
+
+        # ATR bazlı strateji parametrelerini al
+        strategy = get_strategy_params(state["symbol"])
         state["strategy"] = strategy
-        state["atr_pct"]  = atr_pct
-        tps = strategy["tps"]
+
+        sl_pct  = strategy["sl"]
+        tp_pcts = strategy["tps"]
+
         if side == "BUY":
-            tp_prices = [round_to_tick(current_price * (1 + t / 100), tick_size) for t in tps]
-            sl_price  = round_to_tick(current_price * (1 - strategy["sl"] / 100), tick_size)
+            tp_prices = [round_to_tick(current_price * (1 + pct / 100), tick_size) for pct in tp_pcts]
+            sl_price  = round_to_tick(current_price * (1 - sl_pct / 100), tick_size)
         else:
-            tp_prices = [round_to_tick(current_price * (1 - t / 100), tick_size) for t in tps]
-            sl_price  = round_to_tick(current_price * (1 + strategy["sl"] / 100), tick_size)
+            tp_prices = [round_to_tick(current_price * (1 - pct / 100), tick_size) for pct in tp_pcts]
+            sl_price  = round_to_tick(current_price * (1 + sl_pct / 100), tick_size)
+
         state["tp_prices"] = tp_prices
         state["sl_price"]  = sl_price
-        side_text = "🟢 LONG (AL)" if side == "BUY" else "🔴 SHORT (SAT)"
+
+        regime       = strategy["regime"]
+        atr_pct      = strategy["atr_pct"]
+        tsl_callback = strategy["tsl"]
+        regime_emoji = {"dar": "🔵", "orta": "🟡", "genis": "🔴"}.get(regime, "⚪")
+        atr_str      = f"{atr_pct:.2f}%" if atr_pct is not None else "N/A"
+        side_text    = "🟢 LONG (AL)" if side == "BUY" else "🔴 SHORT (SAT)"
+
+        tp_lines = ""
+        for i, (tp, pct) in enumerate(zip(tp_prices, tp_pcts), start=1):
+            extra = " + TSL" if i == len(tp_prices) else ""
+            tp_lines += f"🎯 TP{i} (%{pct}): {tp}  →  %{TP_QTY_PCT} kapat{extra}\n"
+
         msg = (
-            f"📋 <b>SİNYAL ÖNİZLEME</b>\n━━━━━━━━━━━━━━━\n"
-            f"📌 <b>Coin:</b> {symbol}\n"
+            f"📋 <b>SİNYAL ÖNİZLEME</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Coin:</b> {state['symbol']}\n"
             f"📊 <b>Yön:</b> {side_text}\n"
             f"⚡ <b>Kaldıraç:</b> {FIXED_LEVERAGE}x\n"
             f"💰 <b>Tahmini Giriş:</b> {current_price}\n"
-            f"📈 <b>ATR%:</b> {atr_pct:.2f} → {strategy['label']}\n━━━━━━━━━━━━━━━\n"
-            f"🎯 TP1 (%{tps[0]}): {tp_prices[0]}  →  %{TP_QTY_PCT} kapat\n"
-            f"🎯 TP2 (%{tps[1]}): {tp_prices[1]}  →  %{TP_QTY_PCT} kapat\n"
-            f"🎯 TP3 (%{tps[2]}): {tp_prices[2]}  →  %{TP_QTY_PCT} kapat\n"
-            f"🎯 TP4 (%{tps[3]}): {tp_prices[3]}  →  %{TP_QTY_PCT} kapat + TSL\n"
-            f"🔒 SL (%{strategy['sl']}): {sl_price}\n"
-            f"📉 TSL Callback: %{strategy['tsl']}\n━━━━━━━━━━━━━━━"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{regime_emoji} <b>ATR Rejimi:</b> {regime.upper()} (ATR={atr_str})\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{tp_lines}"
+            f"🔒 SL (%{sl_pct}): {sl_price}\n"
+            f"📉 TSL Callback: %{tsl_callback}\n"
+            f"━━━━━━━━━━━━━━━"
         )
         keyboard = [[
             InlineKeyboardButton("✅ ONAYLA & GÖNDER", callback_data="confirm_yes"),
             InlineKeyboardButton("❌ İPTAL",           callback_data="confirm_no"),
         ]]
-        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(msg, parse_mode="HTML",
+                                      reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data == "confirm_yes":
         state = user_states.get(uid, {})
         if not state:
             await query.edit_message_text("⚠️ Oturum süresi doldu.")
             return
+
         await query.edit_message_text("⏳ Sinyal gönderiliyor...")
-        payload = {"secret": WEBHOOK_SECRET, "symbol": state["symbol"], "side": state["side"].lower()}
+
+        payload = {
+            "secret": WEBHOOK_SECRET,
+            "symbol": state["symbol"],
+            "side":   state["side"].lower(),
+        }
         try:
             result = process_signal(payload)
             if result.get("status") == "ok":
+                regime = result.get("regime", "?")
                 await query.edit_message_text(
                     f"✅ <b>Sinyal gönderildi!</b>\n"
                     f"📌 {state['symbol']} | "
-                    f"{'🟢 LONG' if state['side'] == 'BUY' else '🔴 SHORT'} | {FIXED_LEVERAGE}x",
+                    f"{'🟢 LONG' if state['side'] == 'BUY' else '🔴 SHORT'} | "
+                    f"{FIXED_LEVERAGE}x | Rejim: {regime.upper()}",
                     parse_mode="HTML"
                 )
             else:
                 await query.edit_message_text(f"❌ Hata: {result.get('error', 'Bilinmeyen hata')}")
         except Exception as e:
             await query.edit_message_text(f"❌ Hata: {e}")
+
         user_states.pop(uid, None)
 
     elif data == "confirm_no":
@@ -819,6 +897,7 @@ def get_symbol_info(symbol):
                         step_size = float(f["stepSize"])
                 step_str      = f"{step_size:.10f}".rstrip("0")
                 qty_precision = len(step_str.split(".")[1]) if "." in step_str else 0
+                log.info(f"{symbol} tickSize={tick_size}, stepSize={step_size}, qtyPrecision={qty_precision}")
                 return s["pricePrecision"], qty_precision, tick_size
     except ClientError as e:
         log.error(f"Sembol bilgisi alınamadı: {e}")
@@ -829,26 +908,33 @@ def round_to_tick(price: float, tick_size: float) -> float:
     import math
     if tick_size <= 0:
         return price
-    rounded  = math.floor(price / tick_size + 0.5) * tick_size
-    tick_str = f"{tick_size:.10f}".rstrip("0")
-    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+    rounded   = math.floor(price / tick_size + 0.5) * tick_size
+    tick_str  = f"{tick_size:.10f}".rstrip("0")
+    decimals  = len(tick_str.split(".")[1]) if "." in tick_str else 0
     return round(rounded, decimals)
+
+
+def get_valid_leverage(symbol, requested_leverage):
+    try:
+        brackets = client.leverage_brackets(symbol=symbol)
+        for item in brackets:
+            if item["symbol"] == symbol:
+                max_lev = item["brackets"][0]["initialLeverage"]
+                if requested_leverage > max_lev:
+                    log.warning(f"{symbol} max kaldıraç: {max_lev}x")
+                    return max_lev
+                return requested_leverage
+    except Exception as e:
+        log.error(f"Kaldıraç bracket alınamadı: {e}")
+    return requested_leverage
 
 
 def get_current_price(symbol):
     try:
         ticker = client.ticker_price(symbol=symbol)
-        # ticker liste veya dict olarak gelebilir
-        if isinstance(ticker, list):
-            ticker = ticker[0]
-        price = ticker.get("price") or ticker.get("lastPrice") or ticker.get("c")
-        if price:
-            return float(price)
-        log.error(f"Fiyat alanı bulunamadı: {ticker}")
+        return float(ticker["price"])
     except ClientError as e:
         log.error(f"Fiyat alınamadı: {e}")
-    except Exception as e:
-        log.error(f"Fiyat beklenmedik hata: {e}")
     return 0.0
 
 
@@ -864,10 +950,13 @@ def get_entry_price(order, symbol):
         if pos:
             ep = float(pos.get("entryPrice", 0) or 0)
             if ep > 0:
+                log.info(f"avgPrice 0 geldi, pozisyondan alındı: {ep}")
                 return ep
     except Exception:
         pass
-    return get_current_price(symbol)
+    price = get_current_price(symbol)
+    log.warning(f"avgPrice ve entryPrice 0, anlık fiyat kullanılıyor: {price}")
+    return price
 
 
 def set_leverage(symbol, leverage):
@@ -883,8 +972,11 @@ def set_leverage(symbol, leverage):
 def set_margin_type(symbol):
     try:
         client.change_margin_type(symbol=symbol, marginType=MARGIN_TYPE)
+        log.info(f"{symbol} margin tipi {MARGIN_TYPE} ayarlandı")
     except ClientError as e:
-        if "No need to change margin type" not in str(e):
+        if "No need to change margin type" in str(e):
+            log.info(f"{symbol} zaten {MARGIN_TYPE}")
+        else:
             log.error(f"Margin tipi ayarlanamadı: {e}")
 
 
@@ -892,7 +984,7 @@ def calculate_quantity(symbol, leverage, price, qty_precision):
     trade_usdt = TRADE_USDT_FIXED * leverage
     quantity   = trade_usdt / price
     quantity   = round(quantity, qty_precision)
-    log.info(f"Miktar: {quantity} | Pozisyon: {trade_usdt:.2f} USDT")
+    log.info(f"Sabit işlem: {TRADE_USDT_FIXED} USDT marjin | {trade_usdt:.2f} USDT pozisyon | Miktar: {quantity}")
     return quantity
 
 
@@ -911,35 +1003,56 @@ def place_order(symbol, side, quantity):
 
 def place_algo_order(params, label="Emir"):
     params["algoType"] = "CONDITIONAL"
-    resp    = signed_request("POST", "/fapi/v1/algoOrder", params)
+    resp = signed_request("POST", "/fapi/v1/algoOrder", params)
     algo_id = resp.get("algoId") or resp.get("clientAlgoId") or resp.get("orderId")
     if algo_id:
         log.info(f"{label} yerleştirildi ✓ algoId={algo_id}")
         return algo_id
-    log.error(f"{label} yerleştirilemedi: {resp}")
-    return None
+    else:
+        log.error(f"{label} yerleştirilemedi: {resp}")
+        return None
 
 
 def cancel_all_orders(symbol):
     from urllib.parse import urlencode
 
-    def hashing(q):
-        return hmac.new(API_SECRET.encode("utf-8"), q.encode("utf-8"), hashlib.sha256).hexdigest()
+    def hashing(query_string):
+        return hmac.new(
+            API_SECRET.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+    def get_timestamp():
+        return int(time.time() * 1000)
+
+    def dispatch_request(http_method):
+        session = req.Session()
+        session.headers.update({
+            "Content-Type": "application/json;charset=utf-8",
+            "X-MBX-APIKEY": API_KEY
+        })
+        return {"DELETE": session.delete}.get(http_method)
 
     def send_signed_request(http_method, url_path, payload={}):
-        qs = urlencode(payload).replace("%27", "%22")
-        qs = f"{qs}&timestamp={int(time.time()*1000)}" if qs else f"timestamp={int(time.time()*1000)}"
-        url     = BASE_URL + url_path + "?" + qs + "&signature=" + hashing(qs)
-        session = req.Session()
-        session.headers.update({"Content-Type": "application/json;charset=utf-8", "X-MBX-APIKEY": API_KEY})
-        return session.delete(url).json()
+        query_string = urlencode(payload)
+        query_string = query_string.replace("%27", "%22")
+        if query_string:
+            query_string = "{}&timestamp={}".format(query_string, get_timestamp())
+        else:
+            query_string = "timestamp={}".format(get_timestamp())
+        url = BASE_URL + url_path + "?" + query_string + "&signature=" + hashing(query_string)
+        params = {"url": url, "params": {}}
+        response = dispatch_request(http_method)(**params)
+        return response.json()
 
     try:
-        send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+        r = send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+        log.info(f"{symbol} allOpenOrders iptal: {r}")
     except Exception as e:
         log.warning(f"{symbol} allOpenOrders iptal hatası: {e}")
+
     try:
-        send_signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+        r = send_signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+        log.info(f"{symbol} algoOpenOrders iptal: {r}")
     except Exception as e:
         log.warning(f"{symbol} algoOpenOrders iptal hatası: {e}")
 
@@ -948,39 +1061,55 @@ def cancel_all_orders(symbol):
 # EMİR FONKSİYONLARI
 # ════════════════════════════════════════════════════════════════
 
-def place_tp_orders(symbol, side, quantity, entry_price, tp_prices, price_precision, qty_precision, tick_size):
+def place_tp_orders(symbol, side, quantity, entry_price, tp_prices, tp_pcts,
+                    price_precision, qty_precision, tick_size):
     close_side = "SELL" if side == "BUY" else "BUY"
     tp_qty     = round(quantity * (TP_QTY_PCT / 100), qty_precision)
     algo_ids   = []
-    for i, tp_price in enumerate(tp_prices, start=1):
-        tp_r = round_to_tick(tp_price, tick_size)
-        if tp_r <= 0:
+
+    for i, (tp_price, pct) in enumerate(zip(tp_prices, tp_pcts), start=1):
+        tp_price_rounded = round_to_tick(tp_price, tick_size)
+        if tp_price_rounded <= 0:
+            log.error(f"TP{i} fiyatı geçersiz ({tp_price_rounded}), atlanıyor")
             continue
         params = {
-            "symbol": symbol, "side": close_side,
-            "type": "TAKE_PROFIT_MARKET", "quantity": tp_qty,
-            "triggerPrice": tp_r, "workingType": "MARK_PRICE",
-            "reduceOnly": "true", "timeInForce": "GTE_GTC",
+            "symbol":       symbol,
+            "side":         close_side,
+            "type":         "TAKE_PROFIT_MARKET",
+            "quantity":     tp_qty,
+            "triggerPrice": tp_price_rounded,
+            "workingType":  "MARK_PRICE",
+            "reduceOnly":   "true",
+            "timeInForce":  "GTE_GTC",
         }
-        aid = place_algo_order(params, label=f"TP{i} ({tp_r})")
-        if aid:
-            algo_ids.append(aid)
+        algo_id = place_algo_order(params, label=f"TP{i} ({tp_price_rounded} / %{pct})")
+        if algo_id:
+            algo_ids.append(algo_id)
+
     return algo_ids
 
 
-def place_sl_order(symbol, side, quantity, sl_price, price_precision, tick_size):
+def place_sl_order(symbol, side, quantity, entry_price, sl_pct, price_precision, tick_size):
     close_side = "SELL" if side == "BUY" else "BUY"
-    sl_r       = round_to_tick(sl_price, tick_size)
+    if side == "BUY":
+        sl_price = round_to_tick(entry_price * (1 - sl_pct / 100), tick_size)
+    else:
+        sl_price = round_to_tick(entry_price * (1 + sl_pct / 100), tick_size)
     params = {
-        "symbol": symbol, "side": close_side,
-        "type": "STOP_MARKET", "quantity": quantity,
-        "triggerPrice": sl_r, "workingType": "MARK_PRICE",
-        "reduceOnly": "true", "timeInForce": "GTE_GTC",
+        "symbol":       symbol,
+        "side":         close_side,
+        "type":         "STOP_MARKET",
+        "quantity":     quantity,
+        "triggerPrice": sl_price,
+        "workingType":  "MARK_PRICE",
+        "reduceOnly":   "true",
+        "timeInForce":  "GTE_GTC",
     }
-    return place_algo_order(params, label=f"SL ({sl_r})")
+    return place_algo_order(params, label=f"SL ({sl_price} / %{sl_pct})")
 
 
-def place_trailing_stop(symbol, side, quantity, tp4_price, tsl_callback, price_precision, qty_precision, tick_size):
+def place_trailing_stop(symbol, side, quantity, tp4_price, tsl_callback_pct,
+                        price_precision, qty_precision, tick_size):
     close_side    = "SELL" if side == "BUY" else "BUY"
     remaining_pct = 100 - (TP_QTY_PCT * 4)
     tsl_qty       = round(quantity * (remaining_pct / 100), qty_precision)
@@ -989,13 +1118,21 @@ def place_trailing_stop(symbol, side, quantity, tp4_price, tsl_callback, price_p
         return None
     activation = round_to_tick(tp4_price, tick_size)
     params = {
-        "symbol": symbol, "side": close_side,
-        "type": "TRAILING_STOP_MARKET", "quantity": tsl_qty,
-        "activatePrice": activation, "callbackRate": tsl_callback,
-        "workingType": "MARK_PRICE", "reduceOnly": "true",
+        "symbol":        symbol,
+        "side":          close_side,
+        "type":          "TRAILING_STOP_MARKET",
+        "quantity":      tsl_qty,
+        "activatePrice": activation,
+        "callbackRate":  tsl_callback_pct,
+        "workingType":   "MARK_PRICE",
+        "reduceOnly":    "true",
     }
-    return place_algo_order(params, label=f"TSL (aktivasyon={activation}, callback={tsl_callback}%)")
+    return place_algo_order(params, label=f"TSL (aktivasyon={activation}, callback={tsl_callback_pct}%)")
 
+
+# ════════════════════════════════════════════════════════════════
+# AÇIK POZİSYONU KAPAT — KARŞI YÖN SİNYALİ İÇİN
+# ════════════════════════════════════════════════════════════════
 
 def close_existing_position(symbol, existing_pos):
     try:
@@ -1006,18 +1143,26 @@ def close_existing_position(symbol, existing_pos):
         qty      = round(qty, qty_precision)
         pnl      = float(existing_pos.get("unRealizedProfit", 0))
         old_side = "BUY" if amt > 0 else "SELL"
-        client.new_order(symbol=symbol, side=side, type="MARKET",
-                         quantity=qty, positionSide="BOTH", reduceOnly=True)
+
+        client.new_order(
+            symbol=symbol, side=side, type="MARKET",
+            quantity=qty, positionSide="BOTH", reduceOnly=True
+        )
+        log.info(f"{symbol} mevcut pozisyon kapatıldı | PnL: {pnl:.2f} USDT")
+
         cancel_all_orders(symbol)
+
         log_trade_event("REVERSED", symbol, old_side, pnl=pnl)
+
         return old_side, pnl
+
     except ClientError as e:
         log.error(f"{symbol} pozisyon kapatılamadı: {e}")
         return None, None
 
 
 # ════════════════════════════════════════════════════════════════
-# SINYAL İŞLEME — ATR BAZLI
+# SINYAL İŞLEME
 # ════════════════════════════════════════════════════════════════
 
 def process_signal(data: dict) -> dict:
@@ -1029,38 +1174,49 @@ def process_signal(data: dict) -> dict:
         return {"error": "Geçersiz side"}
     side = "BUY" if side_raw == "buy" else "SELL"
 
-    # ATR bazlı strateji seç
-    atr_pct  = get_atr_percent(symbol)
-    strategy = select_strategy(atr_pct)
-    log.info(f"{symbol} strateji: {strategy['label']} | SL:{strategy['sl']} TP:{strategy['tps']} TSL:{strategy['tsl']}")
-
-    # Açık pozisyon kontrolü
+    # ── Açık pozisyon kontrolü ──────────────────────────────────
     existing = get_open_position(symbol)
     if existing:
         amt           = float(existing["positionAmt"])
         existing_side = "BUY" if amt > 0 else "SELL"
+
         if existing_side == side:
             log.info(f"{symbol} aynı yönde pozisyon zaten açık, sinyal atlandı.")
             return {"status": "ignored", "reason": "same direction position already open"}
+
         log.info(f"{symbol} karşı yön sinyali: {existing_side} kapatılıyor, {side} açılıyor.")
         old_side, pnl = close_existing_position(symbol, existing)
         if old_side is None:
             return {"error": "Mevcut pozisyon kapatılamadı"}
+
         notify_position_reversed(symbol, old_side, side, pnl)
         time.sleep(1)
 
+    # ── ATR bazlı strateji parametrelerini belirle ──────────────
+    strategy     = get_strategy_params(symbol)
+    regime       = strategy["regime"]
+    sl_pct       = strategy["sl"]
+    tp_pcts      = strategy["tps"]          # [1,2,3,4] veya [2,4,6,8] veya [3,6,9,12]
+    tsl_callback = strategy["tsl"]
+    atr_pct      = strategy["atr_pct"]
+
+    # ── Sembol bilgisi ──────────────────────────────────────────
     price_precision, qty_precision, tick_size = get_symbol_info(symbol)
     current_price = get_current_price(symbol)
     if current_price == 0:
         return {"error": "Fiyat alınamadı"}
 
+    # ── Margin & Kaldıraç ───────────────────────────────────────
     set_margin_type(symbol)
     set_leverage(symbol, FIXED_LEVERAGE)
+    valid_leverage = FIXED_LEVERAGE
 
-    quantity = calculate_quantity(symbol, FIXED_LEVERAGE, current_price, qty_precision)
+    # ── Miktar ─────────────────────────────────────────────────
+    quantity = calculate_quantity(symbol, valid_leverage, current_price, qty_precision)
     if quantity <= 0:
         return {"error": "Yetersiz bakiye"}
 
+    # ── Pozisyon aç ─────────────────────────────────────────────
     order = place_order(symbol, side, quantity)
     if not order:
         return {"error": "Emir açılamadı"}
@@ -1068,37 +1224,56 @@ def process_signal(data: dict) -> dict:
     entry_price = get_entry_price(order, symbol)
     log.info(f"Giriş fiyatı: {entry_price}")
 
-    tps    = strategy["tps"]
-    sl_pct = strategy["sl"]
-    tsl_cb = strategy["tsl"]
-
+    # ── TP/SL fiyatları (ATR rejimine göre) ─────────────────────
     if side == "BUY":
-        tp_prices = [round_to_tick(entry_price * (1 + t / 100), tick_size) for t in tps]
+        tp_prices = [round_to_tick(entry_price * (1 + pct / 100), tick_size) for pct in tp_pcts]
         sl_price  = round_to_tick(entry_price * (1 - sl_pct / 100), tick_size)
     else:
-        tp_prices = [round_to_tick(entry_price * (1 - t / 100), tick_size) for t in tps]
+        tp_prices = [round_to_tick(entry_price * (1 - pct / 100), tick_size) for pct in tp_pcts]
         sl_price  = round_to_tick(entry_price * (1 + sl_pct / 100), tick_size)
 
-    log.info(f"TP: {tp_prices} | SL: {sl_price} | TSL: {tsl_cb}%")
+    log.info(f"Rejim={regime.upper()} | TP seviyeleri: {tp_prices} | SL: {sl_price} | TSL: %{tsl_callback}")
 
-    place_tp_orders(symbol, side, quantity, entry_price, tp_prices, price_precision, qty_precision, tick_size)
-    place_sl_order(symbol, side, quantity, sl_price, price_precision, tick_size)
-    place_trailing_stop(symbol, side, quantity, tp_prices[3], tsl_cb, price_precision, qty_precision, tick_size)
+    # ── Emirleri yerleştir ──────────────────────────────────────
+    place_tp_orders(symbol, side, quantity, entry_price, tp_prices, tp_pcts,
+                    price_precision, qty_precision, tick_size)
+    place_sl_order(symbol, side, quantity, entry_price, sl_pct, price_precision, tick_size)
+    place_trailing_stop(symbol, side, quantity, tp_prices[3], tsl_callback,
+                        price_precision, qty_precision, tick_size)
 
-    notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price, strategy, atr_pct)
+    notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price,
+                        regime, atr_pct, tsl_callback)
 
+    # ── İstatistik logu ─────────────────────────────────────────
     log_trade_event("OPENED", symbol, side, extra={
-        "entry_price": entry_price,
-        "leverage":    FIXED_LEVERAGE,
-        "atr_pct":     atr_pct,
-        "strategy":    strategy["label"],
-        "tp_prices":   tp_prices,
-        "sl_price":    sl_price,
+        "entry_price":   entry_price,
+        "leverage":      valid_leverage,
+        "tp_prices":     tp_prices,
+        "tp_pcts":       tp_pcts,
+        "sl_price":      sl_price,
+        "sl_pct":        sl_pct,
+        "tsl_callback":  tsl_callback,
+        "regime":        regime,
+        "atr_pct":       atr_pct,
     })
 
-    log.info(f"✅ {symbol} {side} tamamlandı | {FIXED_LEVERAGE}x | Giriş: {entry_price} | ATR%: {atr_pct:.2f}")
-    return {"status": "ok", "symbol": symbol, "side": side, "leverage": FIXED_LEVERAGE, "strategy": strategy["label"]}
+    log.info(
+        f"✅ {symbol} {side} tamamlandı | {valid_leverage}x | "
+        f"Giriş: {entry_price} | Rejim: {regime.upper()}"
+    )
+    return {
+        "status":   "ok",
+        "symbol":   symbol,
+        "side":     side,
+        "leverage": valid_leverage,
+        "regime":   regime,
+        "atr_pct":  atr_pct,
+    }
 
+
+# ════════════════════════════════════════════════════════════════
+# WEBHOOK — TP/SL/TSL CALLBACK ENDPOINT'İ
+# ════════════════════════════════════════════════════════════════
 
 @app.route("/algo_callback", methods=["POST"])
 def algo_callback():
@@ -1176,7 +1351,6 @@ def run_telegram():
         telegram_app.add_handler(CommandHandler("bakiye",           cmd_bakiye))
         telegram_app.add_handler(CommandHandler("pozisyonlar",      cmd_pozisyonlar))
         telegram_app.add_handler(CommandHandler("kapat",            cmd_kapat))
-        telegram_app.add_handler(CommandHandler("atr",              cmd_atr))
         telegram_app.add_handler(CommandHandler("sinyal",           cmd_sinyal))
         telegram_app.add_handler(CommandHandler("istatistik",       cmd_istatistik))
         telegram_app.add_handler(CommandHandler("istatistik_tarih", cmd_istatistik_tarih))
@@ -1241,16 +1415,13 @@ def on_order_event(msg: dict):
         if status != "FILLED":
             return
 
-        is_algo        = bool(order.get("si"))
-        is_liquidation = order.get("ot") == "LIQUIDATION"
-        if not is_algo and not is_liquidation:
+        if not order.get("si"):
             return
 
         event_map = {
             "TAKE_PROFIT_MARKET":   "TP_HIT",
             "STOP_MARKET":          "SL_HIT",
             "TRAILING_STOP_MARKET": "TSL_HIT",
-            "LIQUIDATION":          "SL_HIT",
         }
         ev = event_map.get(otype)
         if not ev:
@@ -1260,11 +1431,7 @@ def on_order_event(msg: dict):
         log_trade_event(ev, symbol, side, pnl=pnl)
 
         emoji = {"TP_HIT": "🎯", "SL_HIT": "🔴", "TSL_HIT": "📉"}.get(ev, "ℹ️")
-        if order.get("ot") == "LIQUIDATION":
-            label = "LİKİDASYON"
-            emoji = "💥"
-        else:
-            label = {"TP_HIT": "TAKE PROFIT", "SL_HIT": "STOP LOSS", "TSL_HIT": "TRAILING STOP"}.get(ev, ev)
+        label = {"TP_HIT": "TAKE PROFIT", "SL_HIT": "STOP LOSS", "TSL_HIT": "TRAILING STOP"}.get(ev, ev)
         send_telegram(
             f"{emoji} <b>{label} TETİKLENDİ</b>\n"
             f"📌 {symbol}\n"
@@ -1322,7 +1489,10 @@ def run_user_stream():
 
 if __name__ == "__main__":
     log.info("🤖 Claude Trading Bot başlatıldı...")
-    log.info(f"⚡ Strateji: {FIXED_LEVERAGE}x | ATR Bazlı SL/TP ")
+    log.info(f"⚡ Strateji: {FIXED_LEVERAGE}x | ATR bazlı dinamik TP/SL")
+    log.info(f"  DAR  (ATR<1.5%): SL %1.0 | TP [1,2,3,4]%   | TSL %1.0")
+    log.info(f"  ORTA (ATR 1.5-3%): SL %2.0 | TP [2,4,6,8]%   | TSL %1.5")
+    log.info(f"  GENİŞ(ATR>3.0%): SL %3.5 | TP [3,6,9,12]%  | TSL %3.0")
 
     init_db()
 
@@ -1331,8 +1501,8 @@ if __name__ == "__main__":
         t.start()
         send_telegram(
             f"🚀 <b>Claude Trading Bot başlatıldı!</b>\n"
-            f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP\n"
-            f"📈 ATR %{ATR_MID_PCT} altı → DAR | %{ATR_MID_PCT}-{ATR_HIGH_PCT} → ORTA | %{ATR_HIGH_PCT} üstü → GENİŞ\n"
+            f"⚡ {FIXED_LEVERAGE}x | ATR bazlı dinamik TP/SL\n"
+            f"🔵 DAR  | 🟡 ORTA  | 🔴 GENİŞ\n"
             f"/yardim ile komutları görebilirsiniz."
         )
     else:
