@@ -1323,14 +1323,17 @@ def on_order_event(msg: dict):
         if status != "FILLED":
             return
 
-        # Sadece algo emirlerini al (si alanı dolu ise algo emri)
-        if not order.get("si"):
+        # LIQUIDATION veya algo emri olmalı
+        is_algo = bool(order.get("si"))
+        is_liquidation = order.get("ot") == "LIQUIDATION"
+        if not is_algo and not is_liquidation:
             return
 
         event_map = {
             "TAKE_PROFIT_MARKET":   "TP_HIT",
             "STOP_MARKET":          "SL_HIT",
             "TRAILING_STOP_MARKET": "TSL_HIT",
+            "LIQUIDATION":          "SL_HIT",
         }
         ev = event_map.get(otype)
         if not ev:
@@ -1340,7 +1343,11 @@ def on_order_event(msg: dict):
         log_trade_event(ev, symbol, side, pnl=pnl)
 
         emoji = {"TP_HIT": "🎯", "SL_HIT": "🔴", "TSL_HIT": "📉"}.get(ev, "ℹ️")
-        label = {"TP_HIT": "TAKE PROFIT", "SL_HIT": "STOP LOSS", "TSL_HIT": "TRAILING STOP"}.get(ev, ev)
+        if order.get("ot") == "LIQUIDATION":
+            label = "LİKİDASYON"
+            emoji = "💥"
+        else:
+            label = {"TP_HIT": "TAKE PROFIT", "SL_HIT": "STOP LOSS", "TSL_HIT": "TRAILING STOP"}.get(ev, ev)
         send_telegram(
             f"{emoji} <b>{label} TETİKLENDİ</b>\n"
             f"📌 {symbol}\n"
