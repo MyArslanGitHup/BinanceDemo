@@ -1272,8 +1272,6 @@ def run_telegram():
 # ════════════════════════════════════════════════════════════════
 
 WS_BASE = "wss://fstream.binancefuture.com/ws/"
-# Demo hesap kullanıyorsan yukarıdaki satırı şununla değiştir:
-# WS_BASE = "wss://stream.binancefuture.com/ws/"
 
 def get_listen_key():
     r = req.post(
@@ -1355,7 +1353,9 @@ def run_user_stream():
 
             def on_message(ws, message):
                 try:
-                    on_order_event(json.loads(message))
+                    data = json.loads(message)
+                    log.info(f"WS RAW: {json.dumps(data)}")  # ← GEÇİCİ DEBUG
+                    on_order_event(data)
                 except Exception as e:
                     log.error(f"WS mesaj hatası: {e}")
 
