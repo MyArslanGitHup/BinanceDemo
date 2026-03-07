@@ -752,6 +752,346 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Sinyal iptal edildi.")
 
 
+# ════════════════════════════════════════════════════════════════
+# İMZALI İSTEK
+# ════════════════════════════════════════════════════════════════
+
+def signed_request(method, path, params):
+    params["timestamp"] = int(time.time() * 1000)
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    sig = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = sig
+    headers = {"X-MBX-APIKEY": API_KEY}
+    url = BASE_URL + path
+    try:
+        if method == "POST":
+            r = req.post(url, headers=headers, data=params, timeout=10)
+        elif method == "DELETE":
+            r = req.delete(url, headers=headers, params=params, timeout=10)
+        else:
+            r = req.get(url, headers=headers, params=params, timeout=10)
+        if not r.content:
+            log.error(f"Boş response geldi: {path}")
+            return {}
+        return r.json()
+    except Exception as e:
+        log.error(f"signed_request hatası [{path}]: {e}")
+        return {}
+
+
+# ════════════════════════════════════════════════════════════════
+# YARDIMCI FONKSİYONLAR
+# ════════════════════════════════════════════════════════════════
+
+def get_usdt_balance():
+    try:
+        balances = client.balance()
+        for b in balances:
+            if b["asset"] == "USDT":
+                return float(b["balance"])
+    except ClientError as e:
+        log.error(f"Kasa bakiyesi alınamadı: {e}")
+    return 0.0
+
+
+def get_open_position(symbol):
+    try:
+        positions = client.get_position_risk(symbol=symbol)
+        for p in positions:
+            if float(p["positionAmt"]) != 0:
+                return p
+    except ClientError as e:
+        log.error(f"Pozisyon bilgisi alınamadı: {e}")
+    return None
+
+
+def get_symbol_info(symbol):
+    try:
+        info = client.exchange_info()
+        for s in info["symbols"]:
+            if s["symbol"] == symbol:
+                tick_size = 0.01
+                step_size = 0.001
+                for f in s.get("filters", []):
+                    if f["filterType"] == "PRICE_FILTER":
+                        tick_size = float(f["tickSize"])
+                    if f["filterType"] == "LOT_SIZE":
+                        step_size = float(f["stepSize"])
+                step_str      = f"{step_size:.10f}".rstrip("0")
+                qty_precision = len(step_str.split(".")[1]) if "." in step_str else 0
+                return s["pricePrecision"], qty_precision, tick_size
+    except ClientError as e:
+        log.error(f"Sembol bilgisi alınamadı: {e}")
+    return 2, 3, 0.01
+
+
+def round_to_tick(price: float, tick_size: float) -> float:
+    import math
+    if tick_size <= 0:
+        return price
+    rounded  = math.floor(price / tick_size + 0.5) * tick_size
+    tick_str = f"{tick_size:.10f}".rstrip("0")
+    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+    return round(rounded, decimals)
+
+
+def get_current_price(symbol):
+    try:
+        ticker = client.ticker_price(symbol=symbol)
+        return float(ticker["price"])
+    except ClientError as e:
+        log.error(f"Fiyat alınamadı: {e}")
+    return 0.0
+
+
+def get_entry_price(order, symbol):
+    try:
+        avg = float(order.get("avgPrice", 0) or 0)
+        if avg > 0:
+            return avg
+    except Exception:
+        pass
+    try:
+        pos = get_open_position(symbol)
+        if pos:
+            ep = float(pos.get("entryPrice", 0) or 0)
+            if ep > 0:
+                return ep
+    except Exception:
+        pass
+    return get_current_price(symbol)
+
+
+def set_leverage(symbol, leverage):
+    try:
+        client.change_leverage(symbol=symbol, leverage=leverage)
+        log.info(f"{symbol} kaldıraç {leverage}x ayarlandı")
+        return True
+    except ClientError as e:
+        log.error(f"Kaldıraç ayarlanamadı: {e}")
+        return False
+
+
+def set_margin_type(symbol):
+    try:
+        client.change_margin_type(symbol=symbol, marginType=MARGIN_TYPE)
+    except ClientError as e:
+        if "No need to change margin type" not in str(e):
+            log.error(f"Margin tipi ayarlanamadı: {e}")
+
+
+def calculate_quantity(symbol, leverage, price, qty_precision):
+    trade_usdt = TRADE_USDT_FIXED * leverage
+    quantity   = trade_usdt / price
+    quantity   = round(quantity, qty_precision)
+    log.info(f"Miktar: {quantity} | Pozisyon: {trade_usdt:.2f} USDT")
+    return quantity
+
+
+def place_order(symbol, side, quantity):
+    try:
+        order = client.new_order(
+            symbol=symbol, side=side, type="MARKET",
+            quantity=quantity, positionSide="BOTH"
+        )
+        log.info(f"Pozisyon açıldı: {symbol} {side} {quantity}")
+        return order
+    except ClientError as e:
+        log.error(f"Emir açılamadı: {e}")
+        return None
+
+
+def place_algo_order(params, label="Emir"):
+    params["algoType"] = "CONDITIONAL"
+    resp    = signed_request("POST", "/fapi/v1/algoOrder", params)
+    algo_id = resp.get("algoId") or resp.get("clientAlgoId") or resp.get("orderId")
+    if algo_id:
+        log.info(f"{label} yerleştirildi ✓ algoId={algo_id}")
+        return algo_id
+    log.error(f"{label} yerleştirilemedi: {resp}")
+    return None
+
+
+def cancel_all_orders(symbol):
+    from urllib.parse import urlencode
+
+    def hashing(q):
+        return hmac.new(API_SECRET.encode("utf-8"), q.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def send_signed_request(http_method, url_path, payload={}):
+        qs = urlencode(payload).replace("%27", "%22")
+        qs = f"{qs}&timestamp={int(time.time()*1000)}" if qs else f"timestamp={int(time.time()*1000)}"
+        url     = BASE_URL + url_path + "?" + qs + "&signature=" + hashing(qs)
+        session = req.Session()
+        session.headers.update({"Content-Type": "application/json;charset=utf-8", "X-MBX-APIKEY": API_KEY})
+        return session.delete(url).json()
+
+    try:
+        send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+    except Exception as e:
+        log.warning(f"{symbol} allOpenOrders iptal hatası: {e}")
+    try:
+        send_signed_request("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+    except Exception as e:
+        log.warning(f"{symbol} algoOpenOrders iptal hatası: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# EMİR FONKSİYONLARI
+# ════════════════════════════════════════════════════════════════
+
+def place_tp_orders(symbol, side, quantity, entry_price, tp_prices, price_precision, qty_precision, tick_size):
+    close_side = "SELL" if side == "BUY" else "BUY"
+    tp_qty     = round(quantity * (TP_QTY_PCT / 100), qty_precision)
+    algo_ids   = []
+    for i, tp_price in enumerate(tp_prices, start=1):
+        tp_r = round_to_tick(tp_price, tick_size)
+        if tp_r <= 0:
+            continue
+        params = {
+            "symbol": symbol, "side": close_side,
+            "type": "TAKE_PROFIT_MARKET", "quantity": tp_qty,
+            "triggerPrice": tp_r, "workingType": "MARK_PRICE",
+            "reduceOnly": "true", "timeInForce": "GTE_GTC",
+        }
+        aid = place_algo_order(params, label=f"TP{i} ({tp_r})")
+        if aid:
+            algo_ids.append(aid)
+    return algo_ids
+
+
+def place_sl_order(symbol, side, quantity, sl_price, price_precision, tick_size):
+    close_side = "SELL" if side == "BUY" else "BUY"
+    sl_r       = round_to_tick(sl_price, tick_size)
+    params = {
+        "symbol": symbol, "side": close_side,
+        "type": "STOP_MARKET", "quantity": quantity,
+        "triggerPrice": sl_r, "workingType": "MARK_PRICE",
+        "reduceOnly": "true", "timeInForce": "GTE_GTC",
+    }
+    return place_algo_order(params, label=f"SL ({sl_r})")
+
+
+def place_trailing_stop(symbol, side, quantity, tp4_price, tsl_callback, price_precision, qty_precision, tick_size):
+    close_side    = "SELL" if side == "BUY" else "BUY"
+    remaining_pct = 100 - (TP_QTY_PCT * 4)
+    tsl_qty       = round(quantity * (remaining_pct / 100), qty_precision)
+    if tsl_qty <= 0:
+        log.warning("TSL: miktar 0, atlanıyor")
+        return None
+    activation = round_to_tick(tp4_price, tick_size)
+    params = {
+        "symbol": symbol, "side": close_side,
+        "type": "TRAILING_STOP_MARKET", "quantity": tsl_qty,
+        "activatePrice": activation, "callbackRate": tsl_callback,
+        "workingType": "MARK_PRICE", "reduceOnly": "true",
+    }
+    return place_algo_order(params, label=f"TSL (aktivasyon={activation}, callback={tsl_callback}%)")
+
+
+def close_existing_position(symbol, existing_pos):
+    try:
+        amt      = float(existing_pos["positionAmt"])
+        side     = "SELL" if amt > 0 else "BUY"
+        qty      = abs(amt)
+        _, qty_precision, _ = get_symbol_info(symbol)
+        qty      = round(qty, qty_precision)
+        pnl      = float(existing_pos.get("unRealizedProfit", 0))
+        old_side = "BUY" if amt > 0 else "SELL"
+        client.new_order(symbol=symbol, side=side, type="MARKET",
+                         quantity=qty, positionSide="BOTH", reduceOnly=True)
+        cancel_all_orders(symbol)
+        log_trade_event("REVERSED", symbol, old_side, pnl=pnl)
+        return old_side, pnl
+    except ClientError as e:
+        log.error(f"{symbol} pozisyon kapatılamadı: {e}")
+        return None, None
+
+
+# ════════════════════════════════════════════════════════════════
+# SINYAL İŞLEME — ATR BAZLI
+# ════════════════════════════════════════════════════════════════
+
+def process_signal(data: dict) -> dict:
+    symbol   = data.get("symbol", "").upper().replace(".P", "").replace(".PERP", "")
+    symbol   = symbol + "USDT" if not symbol.endswith("USDT") else symbol
+    side_raw = data.get("side", "").lower()
+
+    if side_raw not in ["buy", "sell"]:
+        return {"error": "Geçersiz side"}
+    side = "BUY" if side_raw == "buy" else "SELL"
+
+    # ATR bazlı strateji seç
+    atr_pct  = get_atr_percent(symbol)
+    strategy = select_strategy(atr_pct)
+    log.info(f"{symbol} strateji: {strategy['label']} | SL:{strategy['sl']} TP:{strategy['tps']} TSL:{strategy['tsl']}")
+
+    # Açık pozisyon kontrolü
+    existing = get_open_position(symbol)
+    if existing:
+        amt           = float(existing["positionAmt"])
+        existing_side = "BUY" if amt > 0 else "SELL"
+        if existing_side == side:
+            log.info(f"{symbol} aynı yönde pozisyon zaten açık, sinyal atlandı.")
+            return {"status": "ignored", "reason": "same direction position already open"}
+        log.info(f"{symbol} karşı yön sinyali: {existing_side} kapatılıyor, {side} açılıyor.")
+        old_side, pnl = close_existing_position(symbol, existing)
+        if old_side is None:
+            return {"error": "Mevcut pozisyon kapatılamadı"}
+        notify_position_reversed(symbol, old_side, side, pnl)
+        time.sleep(1)
+
+    price_precision, qty_precision, tick_size = get_symbol_info(symbol)
+    current_price = get_current_price(symbol)
+    if current_price == 0:
+        return {"error": "Fiyat alınamadı"}
+
+    set_margin_type(symbol)
+    set_leverage(symbol, FIXED_LEVERAGE)
+
+    quantity = calculate_quantity(symbol, FIXED_LEVERAGE, current_price, qty_precision)
+    if quantity <= 0:
+        return {"error": "Yetersiz bakiye"}
+
+    order = place_order(symbol, side, quantity)
+    if not order:
+        return {"error": "Emir açılamadı"}
+
+    entry_price = get_entry_price(order, symbol)
+    log.info(f"Giriş fiyatı: {entry_price}")
+
+    tps    = strategy["tps"]
+    sl_pct = strategy["sl"]
+    tsl_cb = strategy["tsl"]
+
+    if side == "BUY":
+        tp_prices = [round_to_tick(entry_price * (1 + t / 100), tick_size) for t in tps]
+        sl_price  = round_to_tick(entry_price * (1 - sl_pct / 100), tick_size)
+    else:
+        tp_prices = [round_to_tick(entry_price * (1 - t / 100), tick_size) for t in tps]
+        sl_price  = round_to_tick(entry_price * (1 + sl_pct / 100), tick_size)
+
+    log.info(f"TP: {tp_prices} | SL: {sl_price} | TSL: {tsl_cb}%")
+
+    place_tp_orders(symbol, side, quantity, entry_price, tp_prices, price_precision, qty_precision, tick_size)
+    place_sl_order(symbol, side, quantity, sl_price, price_precision, tick_size)
+    place_trailing_stop(symbol, side, quantity, tp_prices[3], tsl_cb, price_precision, qty_precision, tick_size)
+
+    notify_trade_opened(symbol, side, entry_price, tp_prices, sl_price, strategy, atr_pct)
+
+    log_trade_event("OPENED", symbol, side, extra={
+        "entry_price": entry_price,
+        "leverage":    FIXED_LEVERAGE,
+        "atr_pct":     atr_pct,
+        "strategy":    strategy["label"],
+        "tp_prices":   tp_prices,
+        "sl_price":    sl_price,
+    })
+
+    log.info(f"✅ {symbol} {side} tamamlandı | {FIXED_LEVERAGE}x | Giriş: {entry_price} | ATR%: {atr_pct:.2f}")
+    return {"status": "ok", "symbol": symbol, "side": side, "leverage": FIXED_LEVERAGE, "strategy": strategy["label"]}
+
+
 @app.route("/algo_callback", methods=["POST"])
 def algo_callback():
     try:
