@@ -272,7 +272,44 @@ def build_stats_message(records: list, period_label: str) -> str:
                 cats["Giriş-Açık"]["pnl"]   += pnl
 
     cats["açılan"]["count"] = total_opened
-    cats["açılan"]["pnl"]   = sum(t["pnl"] or 0 for t in trades.values())
+
+    # ── Hâlâ açık pozisyonların anlık PnL'ini Binance'den çek ──
+    try:
+        all_positions = client.get_position_risk()
+        live_pnl = {}
+        for p in all_positions:
+            amt = float(p.get("positionAmt", 0))
+            if amt != 0:
+                live_pnl[p["symbol"]] = float(p.get("unRealizedProfit", 0))
+    except Exception:
+        live_pnl = {}
+
+    # Açık kategorilerdeki PnL'i canlı veriyle güncelle
+    open_cats = ["Giriş-Açık", "TP1(halen açık)", "TP2(halen açık)",
+                 "TP3(halen açık)", "TP4(halen açık)", "TSL(halen açık)"]
+    for trade in trades.values():
+        evs = trade["events"]
+        sym = trade["symbol"]
+        is_closed = ("SL_HIT" in evs or "TSL_HIT" in evs or
+                     "CLOSED_MANUAL" in evs or "REVERSED" in evs)
+        if not is_closed and sym in live_pnl:
+            # Hangi açık kategoriye giriyor bul, PnL'ini güncelle
+            if "TSL_ACTIVE" in evs:
+                cats["TSL(halen açık)"]["pnl"] += live_pnl[sym]
+            elif "TP4_HIT" in evs:
+                cats["TP4(halen açık)"]["pnl"] += live_pnl[sym]
+            elif "TP3_HIT" in evs:
+                cats["TP3(halen açık)"]["pnl"] += live_pnl[sym]
+            elif "TP2_HIT" in evs:
+                cats["TP2(halen açık)"]["pnl"] += live_pnl[sym]
+            elif "TP1_HIT" in evs:
+                cats["TP1(halen açık)"]["pnl"] += live_pnl[sym]
+            else:
+                cats["Giriş-Açık"]["pnl"] += live_pnl[sym]
+
+    cats["açılan"]["pnl"] = sum(
+        cats[c]["pnl"] for c in cats if c != "açılan"
+    )
 
     total_pnl = sum(
         v["pnl"] for k, v in cats.items()
