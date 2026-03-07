@@ -71,9 +71,9 @@ TP_QTY_PCTS    = [30, 20, 20, 20]   # Her TP seviyesinde kapatılacak % (toplam 
 
 # ─── ATR BAZLI DİNAMİK STRATEJİ ────────────────────────────────
 ATR_REGIMES = {
-    "dar":   {"sl": 1.0, "tps": [0.5, 1.0, 1.5, 2.0], "tsl": 1.0},
-    "orta":  {"sl": 2.0, "tps": [1.0, 2.0, 3.0, 4.0], "tsl": 2.0},
-    "genis": {"sl": 4.0, "tps": [2.0, 4.0, 6.0, 8.0], "tsl": 4.0},
+    "dar":   {"sl": 1.0, "tps": [0.5, 1.0, 1.5, 2.0], "tsl": 2.0},
+    "orta":  {"sl": 2.0, "tps": [1.0, 2.0, 3.0, 4.0], "tsl": 4.0},
+    "genis": {"sl": 4.0, "tps": [2.0, 4.0, 6.0, 8.0], "tsl": 6.0},
 }
 ATR_PERIOD          = 13    # ATR hesaplama periyodu — TradingView göstergesiyle eşleşir (SMA 13)
 ATR_FALLBACK_TF     = "1h"  # TradingView timeframe gelmezse kullanılacak varsayılan
