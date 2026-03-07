@@ -467,7 +467,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Claude Trading Bot</b>\n"
         "━━━━━━━━━━━━━━━\n"
         f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP | TSL Dinamik\n"
-        f"📈 ATR &lt;{ATR_MID_PCT}% → DAR | {ATR_MID_PCT}-{ATR_HIGH_PCT}% → ORTA | | &gt;{ATR_HIGH_PCT}% → Sinyal Yokgt;{ATR_HIGH_PCT}% → GENİŞ\n"
+        f"📈 ATR &lt;{ATR_MID_PCT}% → DAR | {ATR_MID_PCT}-{ATR_HIGH_PCT}% → ORTA | &gt;{ATR_HIGH_PCT}% → GENİŞ\n"
         "━━━━━━━━━━━━━━━\n"
         "📋 <b>Komutlar:</b>\n\n"
         "/sinyal — Manuel sinyal gönder\n"
@@ -821,7 +821,7 @@ if __name__ == "__main__":
         send_telegram(
             f"🚀 <b>Claude Trading Bot başlatıldı!</b>\n"
             f"⚡ {FIXED_LEVERAGE}x | ATR Bazlı SL/TP\n"
-            f"📈 ATR &lt;{ATR_MID_PCT}% → DAR | {ATR_MID_PCT}-{ATR_HIGH_PCT}% → ORTA | | &gt;{ATR_HIGH_PCT}% → Sinyal Yokgt;{ATR_HIGH_PCT}% → GENİŞ\n"
+            f"📈 ATR &lt;{ATR_MID_PCT}% → DAR | {ATR_MID_PCT}-{ATR_HIGH_PCT}% → ORTA | &gt;{ATR_HIGH_PCT}% → GENİŞ\n"
             f"/yardim ile komutları görebilirsiniz."
         )
     else:
