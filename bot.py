@@ -196,7 +196,16 @@ def build_stats_message(records: list, period_label: str) -> str:
                 if rec.get("pnl") is not None:
                     trades[key]["pnl"] = (trades[key]["pnl"] or 0) + rec["pnl"]
             else:
-                orphans.append(rec)
+                # OPENED kaydı olmayan TP/SL → yeni trade olarak ekle
+                key = (sym, rec["ts"])
+                trades[key] = {
+                    "symbol": sym,
+                    "side":   rec["side"],
+                    "open_ts": rec["ts"],
+                    "events": ["OPENED", ev],
+                    "pnl":    rec.get("pnl") or 0.0,
+                }
+                opened_by_symbol[sym] = key
 
     # Kategori sayaçları
     cats = {
@@ -1302,20 +1311,8 @@ def on_order_event(msg: dict):
     """TP / SL / TSL tetiklendiğinde çağrılır."""
     event_type = msg.get("e")
 
-    # Demo hesap: ALGO_UPDATE eventi
-    if event_type == "ALGO_UPDATE":
-        order  = msg.get("o", {})
-        status = order.get("X")           # TRIGGERED, TRIGGERING, CANCELLED ...
-        otype  = order.get("o")           # TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET
-        symbol = order.get("s", "")
-        side   = order.get("S", "")
-        pnl    = float(order.get("rp", 0) or 0)
-
-        if status != "TRIGGERED":
-            return
-
-    # Canlı hesap: ORDER_TRADE_UPDATE eventi
-    elif event_type == "ORDER_TRADE_UPDATE":
+    # Gerçek PnL için ORDER_TRADE_UPDATE + FILLED dinle
+    if event_type == "ORDER_TRADE_UPDATE":
         order  = msg.get("o", {})
         status = order.get("X")
         otype  = order.get("ot")
@@ -1326,29 +1323,30 @@ def on_order_event(msg: dict):
         if status != "FILLED":
             return
 
-    else:
-        return
+        # Sadece algo emirlerini al (si alanı dolu ise algo emri)
+        if not order.get("si"):
+            return
 
-    event_map = {
-        "TAKE_PROFIT_MARKET":   "TP_HIT",
-        "STOP_MARKET":          "SL_HIT",
-        "TRAILING_STOP_MARKET": "TSL_HIT",
-    }
-    ev = event_map.get(otype)
-    if not ev:
-        return
+        event_map = {
+            "TAKE_PROFIT_MARKET":   "TP_HIT",
+            "STOP_MARKET":          "SL_HIT",
+            "TRAILING_STOP_MARKET": "TSL_HIT",
+        }
+        ev = event_map.get(otype)
+        if not ev:
+            return
 
-    log.info(f"📥 {ev} tetiklendi → {symbol} {side} PnL={pnl:.2f}")
-    log_trade_event(ev, symbol, side, pnl=pnl)
+        log.info(f"📥 {ev} tetiklendi → {symbol} {side} PnL={pnl:.2f}")
+        log_trade_event(ev, symbol, side, pnl=pnl)
 
-    emoji = {"TP_HIT": "🎯", "SL_HIT": "🔴", "TSL_HIT": "📉"}.get(ev, "ℹ️")
-    label = {"TP_HIT": "TAKE PROFIT", "SL_HIT": "STOP LOSS", "TSL_HIT": "TRAILING STOP"}.get(ev, ev)
-    send_telegram(
-        f"{emoji} <b>{label} TETİKLENDİ</b>\n"
-        f"📌 {symbol}\n"
-        f"💵 PnL: {pnl:+.2f} USDT\n"
-        f"🕐 {time.strftime('%H:%M:%S')}"
-    )
+        emoji = {"TP_HIT": "🎯", "SL_HIT": "🔴", "TSL_HIT": "📉"}.get(ev, "ℹ️")
+        label = {"TP_HIT": "TAKE PROFIT", "SL_HIT": "STOP LOSS", "TSL_HIT": "TRAILING STOP"}.get(ev, ev)
+        send_telegram(
+            f"{emoji} <b>{label} TETİKLENDİ</b>\n"
+            f"📌 {symbol}\n"
+            f"💵 PnL: {pnl:+.2f} USDT\n"
+            f"🕐 {time.strftime('%H:%M:%S')}"
+        )
 
 
 def run_user_stream():
